@@ -9,6 +9,11 @@ on:
 permissions:
   contents: write
 
+release:
+  github:
+    owner: MahmoodShbni
+    name: Backhaul
+
 jobs:
   goreleaser:
     name: Release Project
