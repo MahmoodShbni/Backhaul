@@ -1,40 +1,18 @@
-name: Release
-
-on:
-  workflow_dispatch:
-  push:
-    tags:
-      - 'v*'
-
-permissions:
-  contents: write
-
 release:
   github:
     owner: MahmoodShbni
     name: Backhaul
 
-jobs:
-  goreleaser:
-    name: Release Project
-    runs-on: ubuntu-latest
+builds:
+  - id: default
+    main: ./main.go
+    goos:
+      - windows
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
 
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4  
-        with:
-          fetch-depth: 0 
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.23.1'
-
-      - name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@v6
-        with:
-          distribution: goreleaser
-          version: '~> v2'
-          args: release --clean
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+archives:
+  - format: tar.gz
