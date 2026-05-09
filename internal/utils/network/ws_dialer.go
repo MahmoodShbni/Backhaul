@@ -15,13 +15,15 @@ import (
 )
 
 // uTLS hello specs — هر بار یکی تصادفی انتخاب میشه
+// از Auto استفاده میکنیم که در همه نسخه‌های utls وجود داره
+// و همیشه جدیدترین fingerprint هر مرورگر رو انتخاب میکنه
 var chromeHelloIDs = []utls.ClientHelloID{
-	utls.HelloChrome_120,
-	utls.HelloChrome_112,
-	utls.HelloChrome_106_Shuffle,
-	utls.HelloFirefox_120,
-	utls.HelloFirefox_105,
-	utls.HelloEdge_106,
+	utls.HelloChrome_Auto,
+	utls.HelloChrome_Auto,
+	utls.HelloChrome_Auto,
+	utls.HelloFirefox_Auto,
+	utls.HelloEdge_Auto,
+	utls.HelloSafari_Auto,
 }
 
 func randomHelloID() utls.ClientHelloID {
