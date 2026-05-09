@@ -14,7 +14,7 @@ import (
 	utls "github.com/refraction-networking/utls"
 )
 
-var chromeHelloIDs = []utls.ClientHelloID{
+var helloIDs = []utls.ClientHelloID{
 	utls.HelloChrome_Auto,
 	utls.HelloChrome_Auto,
 	utls.HelloChrome_Auto,
@@ -24,7 +24,7 @@ var chromeHelloIDs = []utls.ClientHelloID{
 }
 
 func randomHelloID() utls.ClientHelloID {
-	return chromeHelloIDs[rand.Intn(len(chromeHelloIDs))]
+	return helloIDs[rand.Intn(len(helloIDs))]
 }
 
 func dialUTLS(ctx context.Context, edgeIP string, sni string, timeout time.Duration, keepalive time.Duration, nodelay bool, SO_RCVBUF int, SO_SNDBUF int) (net.Conn, error) {
@@ -33,13 +33,33 @@ func dialUTLS(ctx context.Context, edgeIP string, sni string, timeout time.Durat
 		return nil, fmt.Errorf("TCP dial failed: %w", err)
 	}
 
+	// HelloCustom میگیره تا بتونیم spec رو دستی modify کنیم
 	uConn := utls.UClient(tcpConn, &utls.Config{
 		ServerName:         sni,
 		InsecureSkipVerify: true,
-		// WebSocket نیاز به HTTP/1.1 داره
-		// بدون این، سرور h2 negotiate میکنه و gorilla کار نمیکنه
-		NextProtos: []string{"http/1.1"},
-	}, randomHelloID())
+	}, utls.HelloCustom)
+
+	// spec رو از browser preset می‌گیریم
+	spec, err := utls.UTLSIdToSpec(randomHelloID())
+	if err != nil {
+		tcpConn.Close()
+		return nil, fmt.Errorf("utls spec error: %w", err)
+	}
+
+	// ALPN extension رو پیدا میکنیم و h2 رو حذف میکنیم
+	// WebSocket فقط روی HTTP/1.1 کار میکنه
+	for i, ext := range spec.Extensions {
+		if alpn, ok := ext.(*utls.ALPNExtension); ok {
+			alpn.AlpnProtocols = []string{"http/1.1"}
+			spec.Extensions[i] = alpn
+			break
+		}
+	}
+
+	if err := uConn.ApplyPreset(&spec); err != nil {
+		tcpConn.Close()
+		return nil, fmt.Errorf("utls apply preset error: %w", err)
+	}
 
 	if err := uConn.HandshakeContext(ctx); err != nil {
 		tcpConn.Close()
@@ -61,11 +81,9 @@ func WebSocketDialer(ctx context.Context, addr string, edgeIP string, path strin
 		if err == nil {
 			return tunnelWSConn, nil
 		}
-
 		if i == retries-1 {
 			break
 		}
-
 		time.Sleep(backoff)
 		backoff *= 2
 	}
@@ -115,7 +133,6 @@ func attemptDialWebSocket(ctx context.Context, addr string, edgeIP string, path 
 	switch mode {
 	case config.WS, config.WSMUX:
 		wsURL = fmt.Sprintf("ws://%s%s", addr, path)
-
 		dialer = websocket.Dialer{
 			EnableCompression: true,
 			HandshakeTimeout:  45 * time.Second,
@@ -126,7 +143,6 @@ func attemptDialWebSocket(ctx context.Context, addr string, edgeIP string, path 
 
 	case config.WSS, config.WSSMUX:
 		wsURL = fmt.Sprintf("wss://%s%s", addr, path)
-
 		dialer = websocket.Dialer{
 			EnableCompression: true,
 			HandshakeTimeout:  45 * time.Second,
