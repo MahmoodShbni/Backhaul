@@ -14,9 +14,6 @@ import (
 	utls "github.com/refraction-networking/utls"
 )
 
-// uTLS hello specs — هر بار یکی تصادفی انتخاب میشه
-// از Auto استفاده میکنیم که در همه نسخه‌های utls وجود داره
-// و همیشه جدیدترین fingerprint هر مرورگر رو انتخاب میکنه
 var chromeHelloIDs = []utls.ClientHelloID{
 	utls.HelloChrome_Auto,
 	utls.HelloChrome_Auto,
@@ -30,7 +27,6 @@ func randomHelloID() utls.ClientHelloID {
 	return chromeHelloIDs[rand.Intn(len(chromeHelloIDs))]
 }
 
-// dialUTLS — TCP میزنه بعد TLS handshake با fingerprint مرورگر
 func dialUTLS(ctx context.Context, edgeIP string, sni string, timeout time.Duration, keepalive time.Duration, nodelay bool, SO_RCVBUF int, SO_SNDBUF int) (net.Conn, error) {
 	tcpConn, err := TcpDialer(ctx, edgeIP, "", timeout, keepalive, nodelay, 1, SO_RCVBUF, SO_SNDBUF, 0)
 	if err != nil {
@@ -40,6 +36,9 @@ func dialUTLS(ctx context.Context, edgeIP string, sni string, timeout time.Durat
 	uConn := utls.UClient(tcpConn, &utls.Config{
 		ServerName:         sni,
 		InsecureSkipVerify: true,
+		// WebSocket نیاز به HTTP/1.1 داره
+		// بدون این، سرور h2 negotiate میکنه و gorilla کار نمیکنه
+		NextProtos: []string{"http/1.1"},
 	}, randomHelloID())
 
 	if err := uConn.HandshakeContext(ctx); err != nil {
@@ -92,7 +91,6 @@ func attemptDialWebSocket(ctx context.Context, addr string, edgeIP string, path 
 	headers.Add("X-User-Id", fmt.Sprintf("%d", randomUserID))
 	headers.Add("User-Agent", randomUserAgent)
 
-	// edgeIP — اگه CDN fronting داری اینجا overrideمیشه
 	targetAddr := addr
 	if edgeIP != "" {
 		_, port, err := net.SplitHostPort(addr)
@@ -102,7 +100,6 @@ func attemptDialWebSocket(ctx context.Context, addr string, edgeIP string, path 
 		targetAddr = fmt.Sprintf("%s:%s", edgeIP, port)
 	}
 
-	// SNI همیشه از addr اصلی (domain)، نه edgeIP
 	sni, _, _ := net.SplitHostPort(addr)
 	if sni == "" {
 		sni = addr
@@ -133,8 +130,6 @@ func attemptDialWebSocket(ctx context.Context, addr string, edgeIP string, path 
 		dialer = websocket.Dialer{
 			EnableCompression: true,
 			HandshakeTimeout:  45 * time.Second,
-			// NetDialTLSContext — TLS رو خودمون با uTLS انجام میدیم
-			// gorilla دیگه TLS نمیزنه، ما میزنیم
 			NetDialTLSContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 				return dialUTLS(ctx, targetAddr, sni, timeout, keepalive, nodelay, SO_RCVBUF, SO_SNDBUF)
 			},
