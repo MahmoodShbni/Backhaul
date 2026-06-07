@@ -37,6 +37,7 @@ type ServerConfig struct {
 	Heartbeat        int           `toml:"heartbeat"`
 	MuxCon           int           `toml:"mux_con"`
 	AcceptUDP        bool          `toml:"accept_udp"`
+	AcceptTCP        bool          `toml:"accept_tcp"`
 	SkipOptz         bool          `toml:"skip_optz"`
 	MSS              int           `toml:"mss"`
 	SO_RCVBUF        int           `toml:"so_rcvbuf"`

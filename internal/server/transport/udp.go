@@ -73,6 +73,7 @@ type UdpConfig struct {
 	Heartbeat    time.Duration
 	ChannelSize  int
 	WebPort      int
+	AcceptTCP    bool // forward TCP over the UDP transport (reliable ARQ)
 }
 
 type UdpTransport struct {
@@ -100,6 +101,20 @@ type UdpTransport struct {
 	rr         uint64           // round-robin cursor for client selection
 
 	seq uint64 // atomic session-id counter (random base so ids are unpredictable)
+
+	relMu   sync.RWMutex
+	relByID map[uint64]*serverRel // reliable TCP-over-UDP sessions
+}
+
+// serverRel is a TCP-over-UDP session on the server (Iran) side: an accepted
+// end-user TCP connection whose byte stream is carried reliably over the tunnel.
+type serverRel struct {
+	id         uint64
+	rel        *utils.RelSession
+	clientAddr *net.UDPAddr
+	tunnelOut  *net.UDPConn
+	enduser    net.Conn
+	opened     int32 // atomic: set to 1 once the client acknowledges the open
 }
 
 func NewUDPServer(parentCtx context.Context, config *UdpConfig, logger *logrus.Logger) *UdpTransport {
@@ -116,6 +131,7 @@ func NewUDPServer(parentCtx context.Context, config *UdpConfig, logger *logrus.L
 		sessByID:      make(map[uint64]*serverSession),
 		sessByEnduser: make(map[string]*serverSession),
 		clientSeen:    make(map[string]int64),
+		relByID:       make(map[uint64]*serverRel),
 		seq:           rand.Uint64(),
 	}
 }
@@ -170,6 +186,12 @@ func (s *UdpTransport) Restart() {
 	s.clientList = nil
 	s.clientSeen = make(map[string]int64)
 	s.clientMu.Unlock()
+	s.relMu.Lock()
+	for _, rs := range s.relByID {
+		rs.rel.Close()
+	}
+	s.relByID = make(map[uint64]*serverRel)
+	s.relMu.Unlock()
 
 	s.logger.SetLevel(level)
 
@@ -384,9 +406,49 @@ func (s *UdpTransport) tunnelReader(uc *net.UDPConn) {
 
 		case utils.UDPOpClose:
 			s.closeSession(id)
+
+		case utils.UDPOpTOpenAck, utils.UDPOpTData, utils.UDPOpTAck, utils.UDPOpTClose, utils.UDPOpTReset:
+			if s.clientAuthed(src) {
+				s.handleRelFrame(op, id, buf[:n])
+			}
 		}
 
 		putUDPBuf(bp)
+	}
+}
+
+// handleRelFrame routes a reliable (TCP-over-UDP) frame to its session.
+func (s *UdpTransport) handleRelFrame(op byte, id uint64, frame []byte) {
+	s.relMu.RLock()
+	rs := s.relByID[id]
+	s.relMu.RUnlock()
+	if rs == nil {
+		return
+	}
+	switch op {
+	case utils.UDPOpTOpenAck:
+		if len(frame) >= utils.UDPHeaderSize+1 && frame[utils.UDPHeaderSize] == 0 {
+			atomic.StoreInt32(&rs.opened, 1)
+		} else {
+			rs.rel.Close() // client failed to dial the target
+		}
+	case utils.UDPOpTData:
+		if len(frame) >= utils.UDPHeaderSize+8 {
+			seq := binary.BigEndian.Uint64(frame[utils.UDPHeaderSize:])
+			rs.rel.OnData(seq, frame[utils.UDPHeaderSize+8:])
+		}
+	case utils.UDPOpTAck:
+		if len(frame) >= utils.UDPHeaderSize+12 {
+			ack := binary.BigEndian.Uint64(frame[utils.UDPHeaderSize:])
+			wnd := binary.BigEndian.Uint32(frame[utils.UDPHeaderSize+8:])
+			rs.rel.OnAck(ack, wnd)
+		}
+	case utils.UDPOpTClose:
+		if len(frame) >= utils.UDPHeaderSize+8 {
+			rs.rel.OnFin(binary.BigEndian.Uint64(frame[utils.UDPHeaderSize:]))
+		}
+	case utils.UDPOpTReset:
+		rs.rel.OnReset()
 	}
 }
 
@@ -422,6 +484,11 @@ func (s *UdpTransport) pickClient() *net.UDPAddr {
 // ---- local listeners (end-user side) ----------------------------------------
 
 func (s *UdpTransport) localListener(localAddr, remoteAddr string) {
+	if s.config.AcceptTCP {
+		s.localListenerTCP(localAddr, remoteAddr)
+		return
+	}
+
 	lc := net.ListenConfig{Control: network.ReusePortControl}
 
 	for i := 0; i < s.workers; i++ {
@@ -635,4 +702,136 @@ func (s *UdpTransport) parseRange(r string) (int, int) {
 		s.logger.Fatalf("invalid end port in range: %s", rangeParts[1])
 	}
 	return start, end
+}
+
+// ---- TCP-over-UDP (accept_tcp) ----------------------------------------------
+
+// localListenerTCP accepts end-user TCP connections and carries each one as a
+// reliable session over the UDP tunnel.
+func (s *UdpTransport) localListenerTCP(localAddr, target string) {
+	ln, err := net.Listen("tcp", localAddr)
+	if err != nil {
+		s.logger.Fatalf("failed to listen on local TCP %s: %v", localAddr, err)
+		return
+	}
+	s.logger.Infof("TCP-over-UDP listener on %s -> %s", localAddr, target)
+
+	go func() {
+		<-s.ctx.Done()
+		ln.Close()
+	}()
+
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			select {
+			case <-s.ctx.Done():
+				return
+			default:
+			}
+			s.logger.Debugf("tcp accept error: %v", err)
+			continue
+		}
+		if tc, ok := conn.(*net.TCPConn); ok {
+			tc.SetNoDelay(true)
+		}
+
+		clientAddr := s.pickClient()
+		if clientAddr == nil {
+			s.logger.Warn("no client tunnel endpoint registered yet, refusing TCP connection")
+			conn.Close()
+			continue
+		}
+
+		id := atomic.AddUint64(&s.seq, 1)
+		tunnelOut := s.tunnelConns[int(id)%len(s.tunnelConns)]
+		rs := &serverRel{id: id, clientAddr: clientAddr, tunnelOut: tunnelOut, enduser: conn}
+		rs.rel = utils.NewRelSession(conn, s.relHooks(id, clientAddr, tunnelOut))
+
+		s.relMu.Lock()
+		s.relByID[id] = rs
+		s.relMu.Unlock()
+
+		rs.rel.Start()
+		go s.openLoop(rs, target)
+		go func() {
+			<-rs.rel.Done()
+			s.relMu.Lock()
+			delete(s.relByID, id)
+			s.relMu.Unlock()
+		}()
+
+		s.logger.Debugf("opened TCP session %d for %s -> %s", id, conn.RemoteAddr(), target)
+	}
+}
+
+// openLoop reliably delivers the OP_TOPEN until the client acknowledges it.
+func (s *UdpTransport) openLoop(rs *serverRel, target string) {
+	ob := getUDPBuf()
+	frame := *ob
+	utils.PutUDPHeader(frame, utils.UDPOpTOpen, rs.id)
+	fn := utils.UDPHeaderSize + copy(frame[utils.UDPHeaderSize:], target)
+	send := func() { _, _ = rs.tunnelOut.WriteToUDP(frame[:fn], rs.clientAddr) }
+	defer putUDPBuf(ob)
+
+	send()
+	t := time.NewTicker(300 * time.Millisecond)
+	defer t.Stop()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-rs.rel.Done():
+			return
+		case <-t.C:
+			if atomic.LoadInt32(&rs.opened) == 1 {
+				return
+			}
+			if time.Now().After(deadline) {
+				s.logger.Debugf("session %d open timed out", rs.id)
+				rs.rel.Close()
+				return
+			}
+			send()
+		}
+	}
+}
+
+func (s *UdpTransport) relHooks(id uint64, clientAddr *net.UDPAddr, out *net.UDPConn) utils.RelHooks {
+	return utils.RelHooks{
+		SendData: func(seq uint64, data []byte) {
+			bp := getUDPBuf()
+			b := *bp
+			utils.PutUDPHeader(b, utils.UDPOpTData, id)
+			binary.BigEndian.PutUint64(b[utils.UDPHeaderSize:], seq)
+			n := utils.UDPHeaderSize + 8 + copy(b[utils.UDPHeaderSize+8:], data)
+			_, _ = out.WriteToUDP(b[:n], clientAddr)
+			putUDPBuf(bp)
+		},
+		SendAck: func(ack uint64, wnd uint32) {
+			bp := getUDPBuf()
+			b := *bp
+			utils.PutUDPHeader(b, utils.UDPOpTAck, id)
+			binary.BigEndian.PutUint64(b[utils.UDPHeaderSize:], ack)
+			binary.BigEndian.PutUint32(b[utils.UDPHeaderSize+8:], wnd)
+			_, _ = out.WriteToUDP(b[:utils.UDPHeaderSize+12], clientAddr)
+			putUDPBuf(bp)
+		},
+		SendFin: func(seq uint64) {
+			bp := getUDPBuf()
+			b := *bp
+			utils.PutUDPHeader(b, utils.UDPOpTClose, id)
+			binary.BigEndian.PutUint64(b[utils.UDPHeaderSize:], seq)
+			_, _ = out.WriteToUDP(b[:utils.UDPHeaderSize+8], clientAddr)
+			putUDPBuf(bp)
+		},
+		SendReset: func() {
+			bp := getUDPBuf()
+			b := *bp
+			utils.PutUDPHeader(b, utils.UDPOpTReset, id)
+			_, _ = out.WriteToUDP(b[:utils.UDPHeaderSize], clientAddr)
+			putUDPBuf(bp)
+		},
+	}
 }

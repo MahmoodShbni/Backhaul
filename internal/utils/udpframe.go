@@ -14,6 +14,16 @@ const (
 	UDPOpNew       byte = 0x02 // server -> client: open a new session toward a target ([2B targetLen][target][payload])
 	UDPOpData      byte = 0x03 // both directions: payload for an existing session
 	UDPOpClose     byte = 0x04 // both directions: tear a session down
+
+	// Reliable stream opcodes (TCP-over-UDP, accept_tcp). These carry a TCP byte
+	// stream over the unreliable tunnel using a small selective-ack ARQ. Payload
+	// layouts (after the 9-byte common header):
+	UDPOpTOpen    byte = 0x05 // server -> client: [target] open a reliable TCP session
+	UDPOpTOpenAck byte = 0x06 // client -> server: [status:1] (0 = ok, 1 = dial failed)
+	UDPOpTData    byte = 0x07 // both: [seq:8][payload] reliable data segment
+	UDPOpTAck     byte = 0x08 // both: [ack:8][wnd:4] cumulative ack + advertised window
+	UDPOpTClose   byte = 0x09 // both: [seq:8] FIN occupying one sequence number
+	UDPOpTReset   byte = 0x0A // both: abort the session immediately
 )
 
 // UDPHeaderSize is the size of the common frame header: [op:1][sessionID:8].

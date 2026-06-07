@@ -85,6 +85,18 @@ type UdpTransport struct {
 
 	mu       sync.RWMutex
 	sessions map[uint64]*clientSession
+
+	relMu   sync.RWMutex
+	relByID map[uint64]*clientRel // reliable TCP-over-UDP sessions
+}
+
+// clientRel is a TCP-over-UDP session on the client (foreign) side: a TCP
+// connection to the real target whose byte stream is carried over the tunnel.
+type clientRel struct {
+	id         uint64
+	rel        *utils.RelSession
+	tunnelConn *net.UDPConn
+	target     net.Conn
 }
 
 func NewUDPClient(parentCtx context.Context, config *UdpConfig, logger *logrus.Logger) *UdpTransport {
@@ -99,6 +111,7 @@ func NewUDPClient(parentCtx context.Context, config *UdpConfig, logger *logrus.L
 		usageMonitor: web.NewDataStore(fmt.Sprintf(":%v", config.WebPort), ctx, config.SnifferLog, config.Sniffer, &config.TunnelStatus, logger),
 		workers:      udpWorkers(),
 		sessions:     make(map[uint64]*clientSession),
+		relByID:      make(map[uint64]*clientRel),
 	}
 }
 
@@ -137,6 +150,12 @@ func (c *UdpTransport) Restart() {
 	}
 	c.sessions = make(map[uint64]*clientSession)
 	c.mu.Unlock()
+	c.relMu.Lock()
+	for _, rs := range c.relByID {
+		rs.rel.Close()
+	}
+	c.relByID = make(map[uint64]*clientRel)
+	c.relMu.Unlock()
 
 	time.Sleep(2 * time.Second)
 
@@ -373,6 +392,12 @@ func (c *UdpTransport) tunnelReader(uc *net.UDPConn) {
 
 		case utils.UDPOpClose:
 			c.closeSession(id)
+
+		case utils.UDPOpTOpen:
+			c.handleTOpen(id, string(buf[utils.UDPHeaderSize:n]), uc)
+
+		case utils.UDPOpTData, utils.UDPOpTAck, utils.UDPOpTClose, utils.UDPOpTReset:
+			c.handleRelFrame(op, id, buf[:n])
 		}
 
 		putUDPBuf(bp)
@@ -483,5 +508,125 @@ func (c *UdpTransport) janitor() {
 				c.sendClose(sess)
 			}
 		}
+	}
+}
+
+// ---- TCP-over-UDP (accept_tcp) ----------------------------------------------
+
+// handleTOpen dials the real target over TCP and starts a reliable session.
+func (c *UdpTransport) handleTOpen(id uint64, target string, tun *net.UDPConn) {
+	c.relMu.RLock()
+	exists := c.relByID[id] != nil
+	c.relMu.RUnlock()
+	if exists {
+		return // duplicate OP_TOPEN (retransmit); already handled
+	}
+
+	conn, err := net.DialTimeout("tcp", target, 10*time.Second)
+	if err != nil {
+		c.logger.Errorf("failed to dial target %s: %v", target, err)
+		c.sendTOpenAck(tun, id, 1)
+		return
+	}
+	if tc, ok := conn.(*net.TCPConn); ok {
+		tc.SetNoDelay(true)
+	}
+
+	rs := &clientRel{id: id, tunnelConn: tun, target: conn}
+	rs.rel = utils.NewRelSession(conn, c.relHooks(id, tun))
+
+	c.relMu.Lock()
+	if c.relByID[id] != nil { // raced with another OP_TOPEN
+		c.relMu.Unlock()
+		conn.Close()
+		return
+	}
+	c.relByID[id] = rs
+	c.relMu.Unlock()
+
+	rs.rel.Start()
+	c.sendTOpenAck(tun, id, 0)
+	go func() {
+		<-rs.rel.Done()
+		c.relMu.Lock()
+		delete(c.relByID, id)
+		c.relMu.Unlock()
+	}()
+
+	c.logger.Debugf("opened TCP session %d -> %s", id, target)
+}
+
+func (c *UdpTransport) handleRelFrame(op byte, id uint64, frame []byte) {
+	c.relMu.RLock()
+	rs := c.relByID[id]
+	c.relMu.RUnlock()
+	if rs == nil {
+		return // unknown session; sender will retransmit after OP_TOPEN is processed
+	}
+	switch op {
+	case utils.UDPOpTData:
+		if len(frame) >= utils.UDPHeaderSize+8 {
+			seq := binary.BigEndian.Uint64(frame[utils.UDPHeaderSize:])
+			rs.rel.OnData(seq, frame[utils.UDPHeaderSize+8:])
+		}
+	case utils.UDPOpTAck:
+		if len(frame) >= utils.UDPHeaderSize+12 {
+			ack := binary.BigEndian.Uint64(frame[utils.UDPHeaderSize:])
+			wnd := binary.BigEndian.Uint32(frame[utils.UDPHeaderSize+8:])
+			rs.rel.OnAck(ack, wnd)
+		}
+	case utils.UDPOpTClose:
+		if len(frame) >= utils.UDPHeaderSize+8 {
+			rs.rel.OnFin(binary.BigEndian.Uint64(frame[utils.UDPHeaderSize:]))
+		}
+	case utils.UDPOpTReset:
+		rs.rel.OnReset()
+	}
+}
+
+func (c *UdpTransport) sendTOpenAck(tun *net.UDPConn, id uint64, status byte) {
+	bp := getUDPBuf()
+	b := *bp
+	utils.PutUDPHeader(b, utils.UDPOpTOpenAck, id)
+	b[utils.UDPHeaderSize] = status
+	_, _ = tun.Write(b[:utils.UDPHeaderSize+1])
+	putUDPBuf(bp)
+}
+
+func (c *UdpTransport) relHooks(id uint64, tun *net.UDPConn) utils.RelHooks {
+	return utils.RelHooks{
+		SendData: func(seq uint64, data []byte) {
+			bp := getUDPBuf()
+			b := *bp
+			utils.PutUDPHeader(b, utils.UDPOpTData, id)
+			binary.BigEndian.PutUint64(b[utils.UDPHeaderSize:], seq)
+			n := utils.UDPHeaderSize + 8 + copy(b[utils.UDPHeaderSize+8:], data)
+			_, _ = tun.Write(b[:n])
+			putUDPBuf(bp)
+		},
+		SendAck: func(ack uint64, wnd uint32) {
+			bp := getUDPBuf()
+			b := *bp
+			utils.PutUDPHeader(b, utils.UDPOpTAck, id)
+			binary.BigEndian.PutUint64(b[utils.UDPHeaderSize:], ack)
+			binary.BigEndian.PutUint32(b[utils.UDPHeaderSize+8:], wnd)
+			_, _ = tun.Write(b[:utils.UDPHeaderSize+12])
+			putUDPBuf(bp)
+		},
+		SendFin: func(seq uint64) {
+			bp := getUDPBuf()
+			b := *bp
+			utils.PutUDPHeader(b, utils.UDPOpTClose, id)
+			binary.BigEndian.PutUint64(b[utils.UDPHeaderSize:], seq)
+			_, _ = tun.Write(b[:utils.UDPHeaderSize+8])
+			putUDPBuf(bp)
+		},
+		SendReset: func() {
+			bp := getUDPBuf()
+			b := *bp
+			utils.PutUDPHeader(b, utils.UDPOpTReset, id)
+			_, _ = tun.Write(b[:utils.UDPHeaderSize])
+			putUDPBuf(bp)
+		},
 	}
 }
