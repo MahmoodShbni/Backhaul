@@ -46,6 +46,20 @@ type RelSession struct {
 	recoveryPoint uint64
 	inRecovery    bool
 
+	// spurious-timeout recovery (F-RTO-style): an RTO on a near-clean path is
+	// often just a late ACK (a CPU/GC spike or a transient latency bump), not a
+	// real drop. We remember the window we collapsed from; if a later ACK shows
+	// every byte outstanding at the RTO instant arrived with no intervening loss
+	// event, the timeout was spurious and we restore the window instead of
+	// crawling back up through slow start. This never delays a retransmit and is
+	// gated so a genuine loss episode is never mistaken for a spurious one.
+	rtoShrunk     bool
+	savedCwnd     uint64
+	savedSsthresh uint64
+	rtoHigh       uint64 // sndNxt captured when the RTO collapse happened
+	lossGen       uint64 // increments on every loss event (fast-rtx or RTO)
+	genAtRTO      uint64 // lossGen captured at the RTO collapse
+
 	// rtt / rto
 	srtt   time.Duration
 	rttvar time.Duration
@@ -156,8 +170,13 @@ func (rs *RelSession) senderLoop() {
 			seg.xmit = 1
 			rs.sndQ = append(rs.sndQ, seg)
 			rs.sndNxt += uint64(n)
-			rs.hooks.SendData(seg.seq, seg.data)
+			sndSeq, sndData := seg.seq, seg.data
 			rs.mu.Unlock()
+			// The first transmission is emitted outside the lock: the segment
+			// cannot be acked (and thus recycled) before the peer receives it,
+			// which requires this very send, so reading seg.data here races with
+			// nothing, and ACK processing is not blocked behind the socket write.
+			rs.hooks.SendData(sndSeq, sndData)
 		} else {
 			relChunkPool.Put(bp)
 		}
@@ -190,6 +209,17 @@ func (rs *RelSession) OnAck(ack uint64, wnd uint32) {
 		acked := ack - rs.sndUna
 		rs.sndUna = ack
 		rs.dupAck = 0
+		// spurious-timeout recovery: if we collapsed on an RTO and this ack clears
+		// everything that was outstanding at that instant, with no loss event
+		// since (lossGen unchanged), the originals had merely been delayed — undo
+		// the collapse. Re-arm once we pass the RTO point either way.
+		if rs.rtoShrunk && ack >= rs.rtoHigh {
+			if rs.lossGen == rs.genAtRTO {
+				rs.cwnd = rs.savedCwnd
+				rs.ssthresh = rs.savedSsthresh
+			}
+			rs.rtoShrunk = false
+		}
 		// grow the congestion window: exponentially in slow start, linearly after.
 		if rs.cwnd < rs.ssthresh {
 			rs.cwnd += acked // slow start
@@ -275,6 +305,7 @@ func (rs *RelSession) sendWindow() uint64 {
 // enterRecovery applies the multiplicative decrease for a single loss event.
 // Caller must hold rs.mu.
 func (rs *RelSession) enterRecovery() {
+	rs.lossGen++
 	rs.ssthresh = rs.cwnd / 2
 	if rs.ssthresh < 2*relMSS {
 		rs.ssthresh = 2 * relMSS
@@ -464,6 +495,14 @@ func (rs *RelSession) timerLoop() {
 			if len(rs.sndQ) > 0 {
 				if time.Since(rs.sndQ[0].sentAt) >= rs.rto {
 					// timeout: severe congestion signal, collapse to slow start
+					rs.lossGen++
+					if !rs.rtoShrunk {
+						rs.savedCwnd = rs.cwnd
+						rs.savedSsthresh = rs.ssthresh
+						rs.rtoHigh = rs.sndNxt
+						rs.genAtRTO = rs.lossGen
+						rs.rtoShrunk = true
+					}
 					rs.ssthresh = rs.cwnd / 2
 					if rs.ssthresh < 2*relMSS {
 						rs.ssthresh = 2 * relMSS

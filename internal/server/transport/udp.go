@@ -478,7 +478,7 @@ func (s *UdpTransport) pickClient() *net.UDPAddr {
 		return nil
 	}
 	i := atomic.AddUint64(&s.rr, 1)
-	return s.clientList[int(i)%len(s.clientList)]
+	return s.clientList[int(i%uint64(len(s.clientList)))]
 }
 
 // ---- local listeners (end-user side) ----------------------------------------
@@ -554,7 +554,7 @@ func (s *UdpTransport) localReader(uc *net.UDPConn, target string) {
 		}
 
 		id := atomic.AddUint64(&s.seq, 1)
-		tunnelOut := s.tunnelConns[int(id)%len(s.tunnelConns)]
+		tunnelOut := s.tunnelConns[int(id%uint64(len(s.tunnelConns)))]
 		sess = &serverSession{
 			id:         id,
 			enduser:    src,
@@ -744,7 +744,7 @@ func (s *UdpTransport) localListenerTCP(localAddr, target string) {
 		}
 
 		id := atomic.AddUint64(&s.seq, 1)
-		tunnelOut := s.tunnelConns[int(id)%len(s.tunnelConns)]
+		tunnelOut := s.tunnelConns[int(id%uint64(len(s.tunnelConns)))]
 		rs := &serverRel{id: id, clientAddr: clientAddr, tunnelOut: tunnelOut, enduser: conn}
 		rs.rel = utils.NewRelSession(conn, s.relHooks(id, clientAddr, tunnelOut))
 
