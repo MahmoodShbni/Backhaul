@@ -2,32 +2,65 @@ package transport
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
+	"math/rand"
 	"net"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/musix/backhaul/internal/utils"
+	"github.com/musix/backhaul/internal/utils/network"
 	"github.com/musix/backhaul/internal/web"
 	"github.com/sirupsen/logrus"
 )
 
-type UdpTransport struct {
-	config            *UdpConfig
-	parentctx         context.Context
-	ctx               context.Context
-	cancel            context.CancelFunc
-	logger            *logrus.Logger
-	tunnelChannel     chan *TunnelUDPConn
-	activeConnections map[string]*TunnelUDPConn
-	activeMu          sync.Mutex
-	reqNewConnChan    chan struct{}
-	controlChannel    net.Conn
-	restartMutex      sync.Mutex
-	usageMonitor      *web.Usage
-	rtt               int64 // for Fun!
+// ---- tuning constants -------------------------------------------------------
+
+const (
+	udpMaxPacket   = 65535 // largest UDP payload we will carry
+	udpBufSize     = utils.UDPHeaderSize + udpMaxPacket
+	udpSocketBuf   = 16 << 20         // 16 MiB SO_RCVBUF/SO_SNDBUF per socket
+	udpIdleTimeout = 60 * time.Second // drop a session after this much silence
+	udpJanitorTick = 15 * time.Second // how often to sweep idle sessions
+	udpMaxWorkers  = 8                // cap on REUSEPORT sockets/reader goroutines
+)
+
+// reusable packet buffers, sized to fit header + a max UDP datagram.
+var udpBufPool = sync.Pool{New: func() any { b := make([]byte, udpBufSize); return &b }}
+
+func getUDPBuf() *[]byte  { return udpBufPool.Get().(*[]byte) }
+func putUDPBuf(b *[]byte) { udpBufPool.Put(b) }
+
+func udpWorkers() int {
+	w := runtime.GOMAXPROCS(0)
+	if w > udpMaxWorkers {
+		w = udpMaxWorkers
+	}
+	if w < 1 {
+		w = 1
+	}
+	return w
+}
+
+// ---- types ------------------------------------------------------------------
+
+// serverSession is one end-user flow. The server originates every session: the
+// first packet from a fresh end-user address allocates an id and an OP_NEW frame
+// carrying the target is pushed into the tunnel. Replies arriving from the
+// tunnel are written back to the end-user on the same local socket.
+type serverSession struct {
+	id         uint64
+	enduser    *net.UDPAddr
+	localConn  *net.UDPConn // local listener socket to reply to the end-user on
+	clientAddr *net.UDPAddr // authenticated client tunnel endpoint this session is pinned to
+	tunnelOut  *net.UDPConn // server tunnel socket used to reach the client
+	enduserKey string       // cached map key, for O(1) deletion
+	lastSeen   int64        // atomic, UnixNano
 }
 
 type UdpConfig struct {
@@ -37,33 +70,56 @@ type UdpConfig struct {
 	TunnelStatus string
 	Ports        []string
 	Sniffer      bool
-	Heartbeat    time.Duration // in seconds, for udp conn and control channel
+	Heartbeat    time.Duration
 	ChannelSize  int
 	WebPort      int
 }
 
+type UdpTransport struct {
+	config    *UdpConfig
+	parentctx context.Context
+	ctx       context.Context
+	cancel    context.CancelFunc
+	logger    *logrus.Logger
+
+	controlChannel net.Conn
+	restartMutex   sync.Mutex
+	usageMonitor   *web.Usage
+	rtt            int64
+
+	workers     int
+	tunnelConns []*net.UDPConn // persistent REUSEPORT tunnel sockets (set once, then read-only)
+
+	mu            sync.RWMutex
+	sessByID      map[uint64]*serverSession
+	sessByEnduser map[string]*serverSession
+
+	clientMu   sync.RWMutex
+	clientList []*net.UDPAddr   // authenticated client tunnel endpoints
+	clientSeen map[string]int64 // endpoint string -> lastSeen UnixNano
+	rr         uint64           // round-robin cursor for client selection
+
+	seq uint64 // atomic session-id counter (random base so ids are unpredictable)
+}
+
 func NewUDPServer(parentCtx context.Context, config *UdpConfig, logger *logrus.Logger) *UdpTransport {
-	// Create a derived context from the parent context
 	ctx, cancel := context.WithCancel(parentCtx)
 
-	// Initialize the TcpTransport struct
-	server := &UdpTransport{
-		config:            config,
-		parentctx:         parentCtx,
-		ctx:               ctx,
-		cancel:            cancel,
-		logger:            logger,
-		tunnelChannel:     make(chan *TunnelUDPConn, config.ChannelSize),
-		activeConnections: map[string]*TunnelUDPConn{},
-		activeMu:          sync.Mutex{},
-		reqNewConnChan:    make(chan struct{}, config.ChannelSize),
-		controlChannel:    nil, // will be set when a control connection is established
-		usageMonitor:      web.NewDataStore(fmt.Sprintf(":%v", config.WebPort), ctx, config.SnifferLog, config.Sniffer, &config.TunnelStatus, logger),
-		rtt:               0,
+	return &UdpTransport{
+		config:        config,
+		parentctx:     parentCtx,
+		ctx:           ctx,
+		cancel:        cancel,
+		logger:        logger,
+		usageMonitor:  web.NewDataStore(fmt.Sprintf(":%v", config.WebPort), ctx, config.SnifferLog, config.Sniffer, &config.TunnelStatus, logger),
+		workers:       udpWorkers(),
+		sessByID:      make(map[uint64]*serverSession),
+		sessByEnduser: make(map[string]*serverSession),
+		clientSeen:    make(map[string]int64),
+		seq:           rand.Uint64(),
 	}
-
-	return server
 }
+
 func (s *UdpTransport) Start() {
 	s.config.TunnelStatus = "Disconnected (UDP)"
 
@@ -83,17 +139,17 @@ func (s *UdpTransport) Restart() {
 
 	s.logger.Info("restarting server...")
 
-	// for removing timeout logs
 	level := s.logger.Level
 	s.logger.SetLevel(logrus.FatalLevel)
 
 	if s.cancel != nil {
 		s.cancel()
 	}
-
-	// Close open connection
 	if s.controlChannel != nil {
 		s.controlChannel.Close()
+	}
+	for _, c := range s.tunnelConns {
+		c.Close()
 	}
 
 	time.Sleep(2 * time.Second)
@@ -102,20 +158,25 @@ func (s *UdpTransport) Restart() {
 	s.ctx = ctx
 	s.cancel = cancel
 
-	// Re-initialize variables
-	s.tunnelChannel = make(chan *TunnelUDPConn, s.config.ChannelSize)
-	s.reqNewConnChan = make(chan struct{}, s.config.ChannelSize)
 	s.usageMonitor = web.NewDataStore(fmt.Sprintf(":%v", s.config.WebPort), ctx, s.config.SnifferLog, s.config.Sniffer, &s.config.TunnelStatus, s.logger)
 	s.config.TunnelStatus = ""
 	s.controlChannel = nil
-	s.activeConnections = map[string]*TunnelUDPConn{}
-	s.activeMu = sync.Mutex{}
+	s.tunnelConns = nil
+	s.mu.Lock()
+	s.sessByID = make(map[uint64]*serverSession)
+	s.sessByEnduser = make(map[string]*serverSession)
+	s.mu.Unlock()
+	s.clientMu.Lock()
+	s.clientList = nil
+	s.clientSeen = make(map[string]int64)
+	s.clientMu.Unlock()
 
-	// set the log level again
 	s.logger.SetLevel(level)
 
 	go s.Start()
 }
+
+// ---- control channel (TCP) --------------------------------------------------
 
 func (s *UdpTransport) channelHandshake() {
 	listener, err := net.Listen("tcp", s.config.BindAddr)
@@ -123,9 +184,7 @@ func (s *UdpTransport) channelHandshake() {
 		s.logger.Fatalf("failed to start listener on %s: %v", s.config.BindAddr, err)
 		return
 	}
-
 	s.logger.Infof("server started successfully, listening on address: %s", listener.Addr().String())
-
 	defer listener.Close()
 
 loop:
@@ -136,34 +195,26 @@ loop:
 		default:
 			conn, err := listener.Accept()
 			if err != nil {
-				s.logger.Debugf("failed to accept control channel connection on %s: %v", listener.Addr().String(), err)
+				s.logger.Debugf("failed to accept control channel connection: %v", err)
 				continue
 			}
 
-			// Set a read deadline for the token response
 			if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
-				s.logger.Errorf("failed to set read deadline: %v", err)
 				conn.Close()
 				continue
 			}
 
 			msg, transport, err := utils.ReceiveBinaryTransportString(conn)
 			if transport != utils.SG_Chan {
-				s.logger.Errorf("invalid signal received for channel, Discarding connection")
+				s.logger.Error("invalid signal received for channel, discarding connection")
 				conn.Close()
 				continue
-
 			} else if err != nil {
-				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-					s.logger.Warn("timeout while waiting for control channel signal")
-				} else {
-					s.logger.Errorf("failed to receive control channel signal: %v", err)
-				}
-				conn.Close() // Close connection on error or timeout
+				s.logger.Errorf("failed to receive control channel signal: %v", err)
+				conn.Close()
 				continue
 			}
 
-			// Resetting the deadline (removes any existing deadline)
 			conn.SetReadDeadline(time.Time{})
 
 			if msg != s.config.Token {
@@ -172,24 +223,24 @@ loop:
 				continue
 			}
 
-			err = utils.SendBinaryTransportString(conn, s.config.Token, utils.SG_Chan)
-			if err != nil {
+			if err = utils.SendBinaryTransportString(conn, s.config.Token, utils.SG_Chan); err != nil {
 				s.logger.Errorf("failed to send security token: %v", err)
 				conn.Close()
 				continue
 			}
 
 			s.controlChannel = conn
-
 			s.logger.Info("control channel successfully established.")
-
 			break loop
 		}
 	}
 
-	go s.tunnelListener()
+	s.config.TunnelStatus = "Connected (UDP)"
+
+	s.startTunnel()
 	go s.parsePortMappings()
 	go s.channelHandler()
+	go s.janitor()
 
 	<-s.ctx.Done()
 }
@@ -198,7 +249,6 @@ func (s *UdpTransport) channelHandler() {
 	ticker := time.NewTicker(s.config.Heartbeat)
 	defer ticker.Stop()
 
-	// Channel to receive the message or error
 	messageChan := make(chan byte, 1)
 
 	go func() {
@@ -210,7 +260,7 @@ func (s *UdpTransport) channelHandler() {
 				message, err := utils.ReceiveBinaryByte(s.controlChannel)
 				if err != nil {
 					if s.cancel != nil {
-						s.logger.Error("failed to read from channel connection. ", err)
+						s.logger.Error("failed to read from control channel. ", err)
 						go s.Restart()
 					}
 					return
@@ -220,11 +270,9 @@ func (s *UdpTransport) channelHandler() {
 		}
 	}()
 
-	// RTT measurment
 	rtt := time.Now()
-	err := utils.SendBinaryByte(s.controlChannel, utils.SG_RTT)
-	if err != nil {
-		s.logger.Error("failed to send RTT signal, attempting to restart server...")
+	if err := utils.SendBinaryByte(s.controlChannel, utils.SG_RTT); err != nil {
+		s.logger.Error("failed to send RTT signal, restarting...")
 		go s.Restart()
 		return
 	}
@@ -235,17 +283,8 @@ func (s *UdpTransport) channelHandler() {
 			_ = utils.SendBinaryByte(s.controlChannel, utils.SG_Closed)
 			return
 
-		case <-s.reqNewConnChan:
-			err := utils.SendBinaryByte(s.controlChannel, utils.SG_Chan)
-			if err != nil {
-				s.logger.Error("failed to send request new connection signal. ", err)
-				go s.Restart()
-				return
-			}
-
 		case <-ticker.C:
-			err := utils.SendBinaryByte(s.controlChannel, utils.SG_HB)
-			if err != nil {
+			if err := utils.SendBinaryByte(s.controlChannel, utils.SG_HB); err != nil {
 				s.logger.Error("failed to send heartbeat signal")
 				go s.Restart()
 				return
@@ -254,116 +293,282 @@ func (s *UdpTransport) channelHandler() {
 
 		case message, ok := <-messageChan:
 			if !ok {
-				s.logger.Error("channel closed, likely due to an error in TCP read")
 				return
 			}
-
-			if message == utils.SG_Closed {
+			switch message {
+			case utils.SG_Closed:
 				s.logger.Warn("control channel has been closed by the client")
 				go s.Restart()
 				return
-
-			} else if message == utils.SG_RTT {
-				measureRTT := time.Since(rtt)
-				s.rtt = measureRTT.Milliseconds()
+			case utils.SG_RTT:
+				s.rtt = time.Since(rtt).Milliseconds()
 				s.logger.Infof("Round Trip Time (RTT): %d ms", s.rtt)
 			}
 		}
 	}
 }
 
-func (s *UdpTransport) tunnelListener() {
-	tunnelUDPAddr, err := net.ResolveUDPAddr("udp", s.config.BindAddr)
-	if err != nil {
-		s.logger.Fatalf("failed to resolve tunnel address: %v", err)
+// ---- tunnel data plane ------------------------------------------------------
+
+func (s *UdpTransport) startTunnel() {
+	lc := net.ListenConfig{Control: network.ReusePortControl}
+	conns := make([]*net.UDPConn, 0, s.workers)
+
+	for i := 0; i < s.workers; i++ {
+		pc, err := lc.ListenPacket(s.ctx, "udp", s.config.BindAddr)
+		if err != nil {
+			s.logger.Fatalf("failed to open tunnel UDP socket on %s: %v", s.config.BindAddr, err)
+			return
+		}
+		uc := pc.(*net.UDPConn)
+		_ = uc.SetReadBuffer(udpSocketBuf)
+		_ = uc.SetWriteBuffer(udpSocketBuf)
+		conns = append(conns, uc)
 	}
 
-	listener, err := net.ListenUDP("udp", tunnelUDPAddr)
-	if err != nil {
-		s.logger.Fatalf("failed to listen on tunnel UDP port: %v", err)
+	s.tunnelConns = conns
+	for _, uc := range conns {
+		go s.tunnelReader(uc)
 	}
 
-	defer listener.Close()
-
-	s.logger.Infof("UDP tunnel listener started successfully, listening on address: %s", listener.LocalAddr().String())
-
-	go s.acceptTunnelConn(listener)
-
-	<-s.ctx.Done()
+	s.logger.Infof("UDP tunnel listening on %s with %d worker socket(s)", s.config.BindAddr, s.workers)
 }
 
-func (s *UdpTransport) acceptTunnelConn(listener *net.UDPConn) {
-	// Buffer for UDP reads
-	buf := make([]byte, 16*1024)
+// tunnelReader consumes frames coming back from the client over one tunnel socket.
+func (s *UdpTransport) tunnelReader(uc *net.UDPConn) {
+	for {
+		bp := getUDPBuf()
+		buf := *bp
+
+		n, src, err := uc.ReadFromUDP(buf)
+		if err != nil {
+			putUDPBuf(bp)
+			select {
+			case <-s.ctx.Done():
+				return
+			default:
+			}
+			s.logger.Debugf("tunnel read error: %v", err)
+			return
+		}
+		if n < utils.UDPHeaderSize {
+			putUDPBuf(bp)
+			continue
+		}
+
+		op, id := utils.ParseUDPHeader(buf)
+		switch op {
+		case utils.UDPOpKeepalive:
+			if string(buf[utils.UDPHeaderSize:n]) == s.config.Token {
+				s.registerClient(src)
+			} else {
+				s.logger.Warnf("invalid token in keepalive from %s", src.String())
+			}
+
+		case utils.UDPOpData:
+			if !s.clientAuthed(src) {
+				putUDPBuf(bp)
+				continue
+			}
+			s.mu.RLock()
+			sess := s.sessByID[id]
+			s.mu.RUnlock()
+			if sess != nil {
+				atomic.StoreInt64(&sess.lastSeen, time.Now().UnixNano())
+				if _, err := sess.localConn.WriteToUDP(buf[utils.UDPHeaderSize:n], sess.enduser); err != nil {
+					s.logger.Debugf("write to end-user failed: %v", err)
+				} else if s.config.Sniffer {
+					s.usageMonitor.AddOrUpdatePort(sess.localConn.LocalAddr().(*net.UDPAddr).Port, uint64(n-utils.UDPHeaderSize))
+				}
+			}
+
+		case utils.UDPOpClose:
+			s.closeSession(id)
+		}
+
+		putUDPBuf(bp)
+	}
+}
+
+func (s *UdpTransport) registerClient(addr *net.UDPAddr) {
+	key := addr.String()
+	now := time.Now().UnixNano()
+	s.clientMu.Lock()
+	if _, ok := s.clientSeen[key]; !ok {
+		s.clientList = append(s.clientList, addr)
+		s.logger.Infof("registered client tunnel endpoint %s", key)
+	}
+	s.clientSeen[key] = now
+	s.clientMu.Unlock()
+}
+
+func (s *UdpTransport) clientAuthed(addr *net.UDPAddr) bool {
+	s.clientMu.RLock()
+	_, ok := s.clientSeen[addr.String()]
+	s.clientMu.RUnlock()
+	return ok
+}
+
+func (s *UdpTransport) pickClient() *net.UDPAddr {
+	s.clientMu.RLock()
+	defer s.clientMu.RUnlock()
+	if len(s.clientList) == 0 {
+		return nil
+	}
+	i := atomic.AddUint64(&s.rr, 1)
+	return s.clientList[int(i)%len(s.clientList)]
+}
+
+// ---- local listeners (end-user side) ----------------------------------------
+
+func (s *UdpTransport) localListener(localAddr, remoteAddr string) {
+	lc := net.ListenConfig{Control: network.ReusePortControl}
+
+	for i := 0; i < s.workers; i++ {
+		pc, err := lc.ListenPacket(s.ctx, "udp", localAddr)
+		if err != nil {
+			s.logger.Fatalf("failed to listen on local UDP %s: %v", localAddr, err)
+			return
+		}
+		uc := pc.(*net.UDPConn)
+		_ = uc.SetReadBuffer(udpSocketBuf)
+		_ = uc.SetWriteBuffer(udpSocketBuf)
+		go s.localReader(uc, remoteAddr)
+	}
+
+	s.logger.Infof("UDP local listener on %s -> %s (%d worker socket(s))", localAddr, remoteAddr, s.workers)
+}
+
+// localReader forwards datagrams from end-users into the tunnel. Header room is
+// reserved at the front of the buffer so the frame header can be stamped in
+// place without copying the payload.
+func (s *UdpTransport) localReader(uc *net.UDPConn, target string) {
+	localPort := uc.LocalAddr().(*net.UDPAddr).Port
+
+	for {
+		bp := getUDPBuf()
+		buf := *bp
+
+		n, src, err := uc.ReadFromUDP(buf[utils.UDPHeaderSize:])
+		if err != nil {
+			putUDPBuf(bp)
+			select {
+			case <-s.ctx.Done():
+				return
+			default:
+			}
+			s.logger.Debugf("local read error: %v", err)
+			return
+		}
+
+		key := strconv.Itoa(localPort) + "|" + src.String()
+
+		s.mu.RLock()
+		sess := s.sessByEnduser[key]
+		s.mu.RUnlock()
+
+		if sess != nil {
+			atomic.StoreInt64(&sess.lastSeen, time.Now().UnixNano())
+			utils.PutUDPHeader(buf, utils.UDPOpData, sess.id)
+			_, _ = sess.tunnelOut.WriteToUDP(buf[:utils.UDPHeaderSize+n], sess.clientAddr)
+			if s.config.Sniffer {
+				s.usageMonitor.AddOrUpdatePort(localPort, uint64(n))
+			}
+			putUDPBuf(bp)
+			continue
+		}
+
+		// brand-new flow: pick a client endpoint and open a session inline.
+		clientAddr := s.pickClient()
+		if clientAddr == nil {
+			s.logger.Warn("no client tunnel endpoint registered yet, dropping UDP packet")
+			putUDPBuf(bp)
+			continue
+		}
+
+		id := atomic.AddUint64(&s.seq, 1)
+		tunnelOut := s.tunnelConns[int(id)%len(s.tunnelConns)]
+		sess = &serverSession{
+			id:         id,
+			enduser:    src,
+			localConn:  uc,
+			clientAddr: clientAddr,
+			tunnelOut:  tunnelOut,
+			enduserKey: key,
+			lastSeen:   time.Now().UnixNano(),
+		}
+
+		s.mu.Lock()
+		s.sessByID[id] = sess
+		s.sessByEnduser[key] = sess
+		s.mu.Unlock()
+
+		// OP_NEW carries the target then the first payload; assembled in a
+		// separate buffer because the layout differs from the steady-state path.
+		ob := getUDPBuf()
+		out := *ob
+		utils.PutUDPHeader(out, utils.UDPOpNew, id)
+		tb := []byte(target)
+		binary.BigEndian.PutUint16(out[utils.UDPHeaderSize:], uint16(len(tb)))
+		off := utils.UDPHeaderSize + 2
+		off += copy(out[off:], tb)
+		off += copy(out[off:], buf[utils.UDPHeaderSize:utils.UDPHeaderSize+n])
+		_, _ = tunnelOut.WriteToUDP(out[:off], clientAddr)
+		putUDPBuf(ob)
+
+		if s.config.Sniffer {
+			s.usageMonitor.AddOrUpdatePort(localPort, uint64(n))
+		}
+		s.logger.Debugf("opened session %d for end-user %s -> %s", id, src.String(), target)
+		putUDPBuf(bp)
+	}
+}
+
+func (s *UdpTransport) closeSession(id uint64) {
+	s.mu.Lock()
+	if sess, ok := s.sessByID[id]; ok {
+		delete(s.sessByID, id)
+		delete(s.sessByEnduser, sess.enduserKey)
+	}
+	s.mu.Unlock()
+}
+
+func (s *UdpTransport) janitor() {
+	t := time.NewTicker(udpJanitorTick)
+	defer t.Stop()
 
 	for {
 		select {
 		case <-s.ctx.Done():
 			return
-		default:
-			n, addr, err := listener.ReadFromUDP(buf)
-			if err != nil {
-				s.logger.Errorf("failed to read from tunnel UDP listener: %v", err)
-				continue
-			}
+		case <-t.C:
+			now := time.Now().UnixNano()
 
-			// Create a unique identifier for the connection based on IP and port
-			key := addr.String()
-
-			s.activeMu.Lock()
-			// Check if the connection is already active
-			if existingConn, exists := s.activeConnections[key]; exists {
-				// Send the payload to the existing connection's payload channel
-				select {
-				case existingConn.payload <- append([]byte(nil), buf[:n]...): // Copy the packet to avoid data overwriting
-					s.logger.Tracef("buffered %d bytes for existing connection %s", n, addr.String())
-
-				default:
-					s.logger.Warnf("payload channel for connection %s is full, dropping UDP packet", addr.String())
+			s.mu.Lock()
+			for id, sess := range s.sessByID {
+				if now-atomic.LoadInt64(&sess.lastSeen) > int64(udpIdleTimeout) {
+					delete(s.sessByID, id)
+					delete(s.sessByEnduser, sess.enduserKey)
 				}
-				s.activeMu.Unlock()
-				continue
 			}
+			s.mu.Unlock()
 
-			s.activeMu.Unlock()
-
-			if string(buf[:n]) != s.config.Token { // For new connections, validate the token
-				s.logger.Errorf("invalid token received from %s", addr.String())
-				continue
+			s.clientMu.Lock()
+			kept := s.clientList[:0]
+			for _, a := range s.clientList {
+				if s.config.Heartbeat == 0 || now-s.clientSeen[a.String()] <= int64(3*s.config.Heartbeat) {
+					kept = append(kept, a)
+				} else {
+					delete(s.clientSeen, a.String())
+				}
 			}
-
-			// Initialize the payload channel for the new connection
-			payloadChan := make(chan []byte, 100_000)
-
-			// Create a new TunnelUDPConn
-			tunnelConn := TunnelUDPConn{
-				timeCreated: time.Now().UnixNano(), // Just for debugging
-				payload:     payloadChan,
-				addr:        addr,
-				listener:    listener,
-				ping:        make(chan struct{}, 1), // Initialize the ping channel
-				mu:          &sync.Mutex{},
-			}
-
-			s.activeMu.Lock()
-			// Add the new connection to the active connections map
-			s.activeConnections[key] = &tunnelConn
-			s.activeMu.Unlock()
-
-			// Send the new tunnel connection to the tunnel channel
-			select {
-			case s.tunnelChannel <- &tunnelConn:
-				go s.keepAlive(&tunnelConn)
-				s.logger.Debugf("accepted tunnel connection from %s", addr.String())
-			default:
-				s.logger.Warn("UDP tunnel channel is full")
-				// Close the newly created connection as it couldn't be added
-				close(tunnelConn.payload)
-				delete(s.activeConnections, key)
-			}
+			s.clientList = kept
+			s.clientMu.Unlock()
 		}
 	}
 }
+
+// ---- port-mapping parsing (setup path) --------------------------------------
 
 func (s *UdpTransport) parsePortMappings() {
 	for _, portMapping := range s.config.Ports {
@@ -371,363 +576,63 @@ func (s *UdpTransport) parsePortMappings() {
 
 		var localAddr, remoteAddr string
 
-		// Check if only a single port or a port range is provided (no "=" present)
-		if len(parts) == 1 {
+		switch len(parts) {
+		case 1:
 			localPortOrRange := strings.TrimSpace(parts[0])
-			remoteAddr = localPortOrRange // If no remote addr is provided, use the local port as the remote port
+			remoteAddr = localPortOrRange
 
-			// Check if it's a port range
 			if strings.Contains(localPortOrRange, "-") {
-				rangeParts := strings.Split(localPortOrRange, "-")
-				if len(rangeParts) != 2 {
-					s.logger.Fatalf("invalid port range format: %s", localPortOrRange)
-				}
-
-				// Parse and validate start and end ports
-				startPort, err := strconv.Atoi(strings.TrimSpace(rangeParts[0]))
-				if err != nil || startPort < 1 || startPort > 65535 {
-					s.logger.Fatalf("invalid start port in range: %s", rangeParts[0])
-				}
-
-				endPort, err := strconv.Atoi(strings.TrimSpace(rangeParts[1]))
-				if err != nil || endPort < 1 || endPort > 65535 || endPort < startPort {
-					s.logger.Fatalf("invalid end port in range: %s", rangeParts[1])
-				}
-
-				// Create listeners for all ports in the range
-				for port := startPort; port <= endPort; port++ {
-					localAddr = fmt.Sprintf(":%d", port)
-					go s.localListener(localAddr, strconv.Itoa(port)) // Use port as the remoteAddr
-					time.Sleep(1 * time.Millisecond)                  // for wide port ranges
+				start, end := s.parseRange(localPortOrRange)
+				for port := start; port <= end; port++ {
+					go s.localListener(fmt.Sprintf(":%d", port), strconv.Itoa(port))
+					time.Sleep(time.Millisecond)
 				}
 				continue
-			} else {
-				// Handle single port case
-				port, err := strconv.Atoi(localPortOrRange)
-				if err != nil || port < 1 || port > 65535 {
-					s.logger.Fatalf("invalid port format: %s", localPortOrRange)
-				}
-				localAddr = fmt.Sprintf(":%d", port)
 			}
-		} else if len(parts) == 2 {
-			// Handle "local=remote" format
+			port, err := strconv.Atoi(localPortOrRange)
+			if err != nil || port < 1 || port > 65535 {
+				s.logger.Fatalf("invalid port format: %s", localPortOrRange)
+			}
+			localAddr = fmt.Sprintf(":%d", port)
+
+		case 2:
 			localPortOrRange := strings.TrimSpace(parts[0])
 			remoteAddr = strings.TrimSpace(parts[1])
 
-			// Check if local port is a range
 			if strings.Contains(localPortOrRange, "-") {
-				rangeParts := strings.Split(localPortOrRange, "-")
-				if len(rangeParts) != 2 {
-					s.logger.Fatalf("invalid port range format: %s", localPortOrRange)
-				}
-
-				// Parse and validate start and end ports
-				startPort, err := strconv.Atoi(strings.TrimSpace(rangeParts[0]))
-				if err != nil || startPort < 1 || startPort > 65535 {
-					s.logger.Fatalf("invalid start port in range: %s", rangeParts[0])
-				}
-
-				endPort, err := strconv.Atoi(strings.TrimSpace(rangeParts[1]))
-				if err != nil || endPort < 1 || endPort > 65535 || endPort < startPort {
-					s.logger.Fatalf("invalid end port in range: %s", rangeParts[1])
-				}
-
-				// Create listeners for all ports in the range
-				for port := startPort; port <= endPort; port++ {
-					localAddr = fmt.Sprintf(":%d", port)
-					go s.localListener(localAddr, remoteAddr)
-					time.Sleep(1 * time.Millisecond) // for wide port ranges
+				start, end := s.parseRange(localPortOrRange)
+				for port := start; port <= end; port++ {
+					go s.localListener(fmt.Sprintf(":%d", port), remoteAddr)
+					time.Sleep(time.Millisecond)
 				}
 				continue
-			} else {
-				// Handle single local port case
-				port, err := strconv.Atoi(localPortOrRange)
-				if err == nil && port > 1 && port < 65535 { // format port=remoteAddress
-					localAddr = fmt.Sprintf(":%d", port)
-				} else {
-					localAddr = localPortOrRange // format ip:port=remoteAddress
-				}
 			}
-		} else {
+			if port, err := strconv.Atoi(localPortOrRange); err == nil && port > 1 && port < 65535 {
+				localAddr = fmt.Sprintf(":%d", port)
+			} else {
+				localAddr = localPortOrRange
+			}
+
+		default:
 			s.logger.Fatalf("invalid port mapping format: %s", portMapping)
 		}
-		// Start listeners for single port
+
 		go s.localListener(localAddr, remoteAddr)
 	}
 }
 
-func (s *UdpTransport) localListener(localAddr, remoteAddr string) {
-	localUDPAddr, err := net.ResolveUDPAddr("udp", localAddr)
-	if err != nil {
-		s.logger.Fatalf("failed to resolve local address: %v", err)
+func (s *UdpTransport) parseRange(r string) (int, int) {
+	rangeParts := strings.Split(r, "-")
+	if len(rangeParts) != 2 {
+		s.logger.Fatalf("invalid port range format: %s", r)
 	}
-
-	listener, err := net.ListenUDP("udp", localUDPAddr)
-	if err != nil {
-		s.logger.Fatalf("failed to listen on local UDP port: %v", err)
+	start, err := strconv.Atoi(strings.TrimSpace(rangeParts[0]))
+	if err != nil || start < 1 || start > 65535 {
+		s.logger.Fatalf("invalid start port in range: %s", rangeParts[0])
 	}
-
-	defer listener.Close()
-
-	s.logger.Infof("UDP listener started successfully, listening on address: %s", listener.LocalAddr().String())
-
-	// Buffer for UDP reads
-	buf := make([]byte, 16*1024)
-
-	// Track active connections
-	activeConnections := map[string]*LocalUDPConn{}
-
-	// mutex
-	mu := &sync.Mutex{}
-
-	// make a new channel for recieve udp packets
-	udpChan := make(chan *LocalUDPConn, s.config.ChannelSize)
-
-	// handle channel
-	go s.handleLoop(udpChan, &activeConnections, mu)
-
-	go func() {
-		for {
-			select {
-			case <-s.ctx.Done():
-				return
-			default:
-				n, addr, err := listener.ReadFromUDP(buf)
-				if err != nil {
-					s.logger.Errorf("failed to read from UDP listener: %v", err)
-					continue
-				}
-
-				// Create a unique identifier for the connection based on IP and port
-				key := addr.String()
-
-				mu.Lock()
-				// Check if the connection is already active
-				if existingConn, exists := activeConnections[key]; exists {
-					// If connection is active and not closed, send payload
-					select {
-					case existingConn.payload <- append([]byte(nil), buf[:n]...):
-						s.logger.Tracef("buffered %d bytes for existing connection %s", n, addr.String())
-					default:
-						s.logger.Warnf("payload channel for connection %s is full, dropping UDP packet", addr.String())
-					}
-					mu.Unlock()
-					continue
-				}
-
-				mu.Unlock()
-
-				// Create a new payload channel for this connection, Buffer up to 100,000 packets for the connection
-				payloadChan := make(chan []byte, 100_000)
-
-				// Build the UDP connection object
-				newUDPConn := LocalUDPConn{
-					timeCreated: time.Now().UnixMilli(), // Just for debugging
-					payload:     payloadChan,
-					remoteAddr:  remoteAddr,
-					listener:    listener,
-					addr:        addr,
-				}
-
-				mu.Lock()
-				// Store the new connection
-				activeConnections[key] = &newUDPConn
-				mu.Unlock()
-
-				select {
-				case udpChan <- &newUDPConn:
-					s.logger.Debugf("accepted UDP connection from %s", addr.String())
-					payloadChan <- append([]byte(nil), buf[:n]...) // Send a copy of the new payload to the channel
-
-					// Request a new TCP connection
-					select {
-					case s.reqNewConnChan <- struct{}{}:
-						// Successfully requested a new TCP connection
-					default:
-						// The channel is full, do nothing
-						s.logger.Warn("channel is full, cannot request a new connection")
-					}
-
-				default:
-					s.logger.Warn("UDP channel is full, dropping packet.")
-					// Close the newly created connection as it couldn't be added
-					close(newUDPConn.payload)
-					delete(activeConnections, key)
-				}
-			}
-		}
-	}()
-
-	<-s.ctx.Done()
-
-}
-
-func (s *UdpTransport) handleLoop(udpChan chan *LocalUDPConn, activeConnections *map[string]*LocalUDPConn, mu *sync.Mutex) {
-	for {
-		select {
-		case <-s.ctx.Done():
-			return
-		case localConn := <-udpChan:
-			if time.Now().UnixMilli()-localConn.timeCreated > 3000 { // 3000ms
-				s.logger.Debugf("timeouted local connection: %d ms", time.Now().UnixMilli()-localConn.timeCreated)
-				continue
-			}
-
-		loop:
-			for {
-				select {
-				case <-s.ctx.Done():
-					return
-
-				case tunnelConn := <-s.tunnelChannel:
-					close(tunnelConn.ping)
-					tunnelConn.mu.Lock()
-
-					// Send the target addr over the connection
-					if _, err := tunnelConn.listener.WriteTo([]byte(localConn.remoteAddr), tunnelConn.addr); err != nil {
-						s.logger.Errorf("%v", err)
-						continue loop
-					}
-
-					// Handle data exchange between connections
-					go s.udpCopy(localConn, tunnelConn, activeConnections, mu)
-
-					s.logger.Debugf("initiate new handler for connection %s with timestamp %d", localConn.addr.String(), localConn.timeCreated)
-					break loop
-				}
-			}
-		}
+	end, err := strconv.Atoi(strings.TrimSpace(rangeParts[1]))
+	if err != nil || end < 1 || end > 65535 || end < start {
+		s.logger.Fatalf("invalid end port in range: %s", rangeParts[1])
 	}
-}
-
-func (s *UdpTransport) udpCopy(udpLocal *LocalUDPConn, udpTunnel *TunnelUDPConn, activeConnections *map[string]*LocalUDPConn, mu *sync.Mutex) {
-	done := make(chan struct{})
-
-	// Handle data from local to tunnel
-	go func() {
-		defer close(done)
-		s.udpLocalCopy(udpLocal, udpTunnel)
-	}()
-
-	// Handle data from tunnel to local
-	s.udpTunnelCopy(udpTunnel, udpLocal)
-
-	// Wait until one of the directions is done (connection closed or idle)
-	<-done
-
-	// Remove local connection from active connections and close the channel
-	mu.Lock()
-	close(udpLocal.payload)
-	delete(*activeConnections, udpLocal.addr.String())
-	mu.Unlock()
-
-	// Remove tunnel connection from active connections and close the channel
-	s.activeMu.Lock()
-	close(udpTunnel.payload)
-	delete(s.activeConnections, udpTunnel.addr.String())
-	s.activeMu.Unlock()
-
-}
-
-func (s *UdpTransport) udpLocalCopy(from *LocalUDPConn, to *TunnelUDPConn) {
-	inactivityTimeout := 60 * time.Second // Define a 60-second inactivity timeout
-
-	for {
-		select {
-		case data, ok := <-from.payload: // Wait for data on the UDP payload channel
-			if !ok {
-				return
-			}
-
-			packetSize := len(data)
-
-			totalWritten := 0
-			for totalWritten < packetSize {
-				// Write the packet to the tunnel
-				w, err := to.listener.WriteToUDP(data[totalWritten:], to.addr)
-				if err != nil {
-					s.logger.Errorf("failed to write UDP payload to tunnel: %v", err)
-					return
-				}
-				totalWritten += w
-			}
-
-			if s.config.Sniffer {
-				s.usageMonitor.AddOrUpdatePort(from.listener.LocalAddr().(*net.UDPAddr).Port, uint64(totalWritten))
-			}
-
-			s.logger.Debugf("forwarded %d bytes from local connection %s to tunnel", packetSize, from.addr.String())
-
-		case <-time.After(inactivityTimeout): // Timeout after 30 seconds of inactivity
-			s.logger.Debugf("connection idle for 60 seconds, closing UDP connection for %s", from.addr.String())
-			return
-		}
-	}
-}
-
-func (s *UdpTransport) udpTunnelCopy(from *TunnelUDPConn, to *LocalUDPConn) {
-	inactivityTimeout := 60 * time.Second // Define a 60-second inactivity timeout
-
-	for {
-		select {
-		case data, ok := <-from.payload: // Wait for data on the UDP payload channel
-			if !ok {
-				return
-			}
-
-			packetSize := len(data)
-
-			totalWritten := 0
-			for totalWritten < packetSize {
-				// Write the packet to the tunnel
-				w, err := to.listener.WriteToUDP(data[totalWritten:], to.addr)
-				if err != nil {
-					s.logger.Errorf("failed to write UDP payload to tunnel: %v", err)
-					return
-				}
-				totalWritten += w
-			}
-
-			if s.config.Sniffer {
-				s.usageMonitor.AddOrUpdatePort(to.listener.LocalAddr().(*net.UDPAddr).Port, uint64(totalWritten))
-			}
-
-			s.logger.Debugf("forwarded %d bytes from local connection %s to tunnel", packetSize, from.addr.String())
-
-		case <-time.After(inactivityTimeout): // Timeout after 30 seconds of inactivity
-			s.logger.Debugf("connection idle for 60 seconds, closing UDP connection for %s", from.addr.String())
-			return
-		}
-	}
-}
-
-func (s *UdpTransport) keepAlive(conn *TunnelUDPConn) {
-	ticker := time.NewTicker(s.config.Heartbeat) // Send periodic pings to the client
-
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-s.ctx.Done():
-			return
-
-		case <-conn.ping:
-			s.logger.Trace("ping channel closed")
-			return
-		case <-ticker.C:
-			// Try to acquire the lock without blocking
-			locked := conn.mu.TryLock()
-			if !locked {
-				// If the lock is held by another operation, stop the pingSender
-				s.logger.Trace("write operation in progress, stopping pingSender")
-				return
-			}
-			if _, err := conn.listener.WriteTo([]byte{utils.SG_Ping}, conn.addr); err != nil {
-				conn.mu.Unlock()
-				return
-			}
-			conn.mu.Unlock()
-			s.logger.Trace("ping sent to the client")
-		}
-	}
+	return start, end
 }

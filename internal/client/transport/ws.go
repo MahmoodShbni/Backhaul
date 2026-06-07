@@ -3,9 +3,7 @@ package transport
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
 	"fmt"
-	"math/big"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -34,7 +32,6 @@ type WsTransport struct {
 	loadConnections int32
 	controlFlow     chan struct{}
 }
-
 type WsConfig struct {
 	RemoteAddr     string
 	Token          string
@@ -52,62 +49,38 @@ type WsConfig struct {
 	EdgeIP         string
 }
 
-// cryptoRandInt returns a random int in [0, n)
-func cryptoRandInt(n int) int {
-	if n <= 0 {
-		return 0
-	}
-	val, err := rand.Int(rand.Reader, big.NewInt(int64(n)))
-	if err != nil {
-		return 0
-	}
-	return int(val.Int64())
-}
-
-// jitteredSleep sleeps base ± (jitterFrac * base)
-func jitteredSleep(base time.Duration, jitterFrac float64) {
-	jitter := time.Duration(float64(base) * jitterFrac)
-	delta := time.Duration(cryptoRandInt(int(2*jitter+1))) - jitter
-	d := base + delta
-	if d < 500*time.Millisecond {
-		d = 500 * time.Millisecond
-	}
-	time.Sleep(d)
-}
-
-// randPadding returns a random byte slice of length in [minLen, maxLen]
-func randPadding(minLen, maxLen int) []byte {
-	size := minLen + cryptoRandInt(maxLen-minLen+1)
-	buf := make([]byte, size)
-	rand.Read(buf)
-	return buf
-}
-
 func NewWSClient(parentCtx context.Context, config *WsConfig, logger *logrus.Logger) *WsTransport {
+	// Create a derived context from the parent context
 	ctx, cancel := context.WithCancel(parentCtx)
+
+	// Initialize the TcpTransport struct
 	client := &WsTransport{
 		config:          config,
 		parentctx:       parentCtx,
 		ctx:             ctx,
 		cancel:          cancel,
 		logger:          logger,
-		controlChannel:  nil,
+		controlChannel:  nil, // will be set when a control connection is established
 		usageMonitor:    web.NewDataStore(fmt.Sprintf(":%v", config.WebPort), ctx, config.SnifferLog, config.Sniffer, &config.TunnelStatus, logger),
 		poolConnections: 0,
 		loadConnections: 0,
 		controlFlow:     make(chan struct{}, 100),
 	}
+
 	return client
 }
 
 func (c *WsTransport) Start() {
+	// for  webui
 	if c.config.WebPort > 0 {
 		go c.usageMonitor.Monitor()
 	}
-	c.config.TunnelStatus = fmt.Sprintf("Disconnected (%s)", c.config.Mode)
-	go c.channelDialer()
-}
 
+	c.config.TunnelStatus = fmt.Sprintf("Disconnected (%s)", c.config.Mode)
+
+	go c.channelDialer()
+
+}
 func (c *WsTransport) Restart() {
 	if !c.restartMutex.TryLock() {
 		c.logger.Warn("client is already restarting")
@@ -116,12 +89,16 @@ func (c *WsTransport) Restart() {
 	defer c.restartMutex.Unlock()
 
 	c.logger.Info("restarting client...")
+
+	// for removing timeout logs
 	level := c.logger.Level
 	c.logger.SetLevel(logrus.FatalLevel)
 
 	if c.cancel != nil {
 		c.cancel()
 	}
+
+	// close control channel connection
 	if c.controlChannel != nil {
 		c.controlChannel.Close()
 	}
@@ -131,12 +108,16 @@ func (c *WsTransport) Restart() {
 	ctx, cancel := context.WithCancel(c.parentctx)
 	c.ctx = ctx
 	c.cancel = cancel
+
+	// Re-initialize variables
 	c.controlChannel = nil
 	c.usageMonitor = web.NewDataStore(fmt.Sprintf(":%v", c.config.WebPort), ctx, c.config.SnifferLog, c.config.Sniffer, &c.config.TunnelStatus, c.logger)
 	c.config.TunnelStatus = ""
 	c.poolConnections = 0
 	c.loadConnections = 0
 	c.controlFlow = make(chan struct{}, 100)
+
+	// set the log level again
 	c.logger.SetLevel(level)
 
 	go c.Start()
@@ -158,25 +139,23 @@ func (c *WsTransport) channelDialer() {
 			}
 			c.controlChannel = tunnelWSConn
 			c.logger.Info("control channel established successfully")
+
 			c.config.TunnelStatus = fmt.Sprintf("Connected (%s)", c.config.Mode)
 
 			go c.poolMaintainer()
 			go c.channelHandler()
+
 			return
 		}
 	}
 }
 
 func (c *WsTransport) poolMaintainer() {
-	// Stagger initial pool fill — avoids burst of simultaneous connections
-	// which is a strong fingerprint for DPI detection
-	for i := 0; i < c.config.ConnPoolSize; i++ {
+	for i := 0; i < c.config.ConnPoolSize; i++ { //initial pool filling
 		go c.tunnelDialer()
-		// Random delay 200–700ms between each connection
-		delay := time.Duration(200+cryptoRandInt(500)) * time.Millisecond
-		time.Sleep(delay)
 	}
 
+	// factors
 	a := 4
 	b := 5
 	x := 3
@@ -192,10 +171,11 @@ func (c *WsTransport) poolMaintainer() {
 
 	tickerPool := time.NewTicker(time.Second * 1)
 	defer tickerPool.Stop()
+
 	tickerLoad := time.NewTicker(time.Second * 10)
 	defer tickerLoad.Stop()
 
-	newPoolSize := c.config.ConnPoolSize
+	newPoolSize := c.config.ConnPoolSize // intial value
 	var poolConnectionsSum int32 = 0
 
 	for {
@@ -204,40 +184,47 @@ func (c *WsTransport) poolMaintainer() {
 			return
 
 		case <-tickerPool.C:
+			// Accumulate pool connections over time (every second)
 			atomic.AddInt32(&poolConnectionsSum, atomic.LoadInt32(&c.poolConnections))
 
 		case <-tickerLoad.C:
-			loadConnections := (int(atomic.LoadInt32(&c.loadConnections)) + 9) / 10
-			atomic.StoreInt32(&c.loadConnections, 0)
+			// Calculate the loadConnections over the last 10 seconds
+			loadConnections := (int(atomic.LoadInt32(&c.loadConnections)) + 9) / 10 // +9 for ceil-like logic
+			atomic.StoreInt32(&c.loadConnections, 0)                                // Reset
 
-			poolConnectionsAvg := (int(atomic.LoadInt32(&poolConnectionsSum)) + 9) / 10
-			atomic.StoreInt32(&poolConnectionsSum, 0)
+			// Calculate the average pool connections over the last 10 seconds
+			poolConnectionsAvg := (int(atomic.LoadInt32(&poolConnectionsSum)) + 9) / 10 // +9 for ceil-like logic
+			atomic.StoreInt32(&poolConnectionsSum, 0)                                   // Reset
 
+			// Dynamically adjust the pool size based on current connections
 			if (loadConnections + a) > poolConnectionsAvg*b {
-				c.logger.Debugf("increasing pool size: %d -> %d", newPoolSize, newPoolSize+1)
+				c.logger.Debugf("increasing pool size: %d -> %d, avg pool conn: %d, avg load conn: %d", newPoolSize, newPoolSize+1, poolConnectionsAvg, loadConnections)
 				newPoolSize++
-				// Stagger new pool connections too
-				go func() {
-					time.Sleep(time.Duration(cryptoRandInt(300)) * time.Millisecond)
-					c.tunnelDialer()
-				}()
+
+				// Add a new connection to the pool
+				go c.tunnelDialer()
 			} else if float64(loadConnections+x) < float64(poolConnectionsAvg)*y && newPoolSize > c.config.ConnPoolSize {
-				c.logger.Debugf("decreasing pool size: %d -> %d", newPoolSize, newPoolSize-1)
+				c.logger.Debugf("decreasing pool size: %d -> %d, avg pool conn: %d, avg load conn: %d", newPoolSize, newPoolSize-1, poolConnectionsAvg, loadConnections)
 				newPoolSize--
+
+				// send a signal to controlFlow
 				c.controlFlow <- struct{}{}
 			}
 		}
 	}
+
 }
 
 func (c *WsTransport) channelHandler() {
 	msgChan := make(chan byte, 1000)
 
+	// Goroutine to handle the blocking ReceiveBinaryString
 	go func() {
 		for {
 			select {
 			case <-c.ctx.Done():
 				return
+
 			default:
 				_, msg, err := c.controlChannel.ReadMessage()
 				if err != nil {
@@ -247,12 +234,13 @@ func (c *WsTransport) channelHandler() {
 					}
 					return
 				}
-				// Only first byte is the signal; rest is padding — ignore it
+
 				msgChan <- msg[0]
 			}
 		}
 	}()
 
+	// Main loop to listen for context cancellation or received messages
 	for {
 		select {
 		case <-c.ctx.Done():
@@ -264,7 +252,8 @@ func (c *WsTransport) channelHandler() {
 			case utils.SG_Chan:
 				atomic.AddInt32(&c.loadConnections, 1)
 				select {
-				case <-c.controlFlow:
+				case <-c.controlFlow: // Do nothing
+
 				default:
 					c.logger.Debug("channel signal received, initiating tunnel dialer")
 					go c.tunnelDialer()
@@ -272,9 +261,8 @@ func (c *WsTransport) channelHandler() {
 
 			case utils.SG_HB:
 				c.logger.Debug("heartbeat signal received successfully")
-				// Reply with padded heartbeat too
-				payload := append([]byte{utils.SG_HB}, randPadding(16, 96)...)
-				err := c.controlChannel.WriteMessage(websocket.BinaryMessage, payload)
+				// send heartbeat back
+				err := c.controlChannel.WriteMessage(websocket.BinaryMessage, []byte{utils.SG_HB})
 				if err != nil {
 					c.logger.Errorf("failed to send heartbeat: %v", msg)
 					go c.Restart()
@@ -299,12 +287,15 @@ func (c *WsTransport) channelHandler() {
 func (c *WsTransport) tunnelDialer() {
 	c.logger.Debugf("initiating new websocket tunnel connection to address %s", c.config.RemoteAddr)
 
+	// Dial to the tunnel server
 	tunnelConn, err := network.WebSocketDialer(c.ctx, c.config.RemoteAddr, c.config.EdgeIP, "/tunnel", c.config.DialTimeOut, c.config.KeepAlive, c.config.Nodelay, c.config.Token, c.config.Mode, 3, 1024*1024, 1024*1024)
 	if err != nil {
 		c.logger.Errorf("tunnel server dialer: %v", err)
+
 		return
 	}
 
+	// Increment active connections counter
 	atomic.AddInt32(&c.poolConnections, 1)
 
 	for {
@@ -316,30 +307,28 @@ func (c *WsTransport) tunnelDialer() {
 			if err != nil {
 				c.logger.Debugf("unable to get port from websocket connection %s: %v", tunnelConn.RemoteAddr().String(), err)
 				tunnelConn.Close()
+
+				// Decrement active connections on failure
 				atomic.AddInt32(&c.poolConnections, -1)
+
 				return
 			}
 
-			// Check first byte only — server now sends padded pings
-			if len(remoteAddrBytes) > 0 && remoteAddrBytes[0] == utils.SG_Ping {
+			if bytes.Equal(remoteAddrBytes, []byte{utils.SG_Ping}) {
 				c.logger.Trace("ping received from the server")
 				continue
 			}
 
-			// Legacy exact-match kept as fallback (for compatibility with unpatched servers)
-			if bytes.Equal(remoteAddrBytes, []byte{utils.SG_Ping}) {
-				c.logger.Trace("ping received from the server (legacy)")
-				continue
-			}
-
+			// Decrement active connections
 			atomic.AddInt32(&c.poolConnections, -1)
 
 			remoteAddr := string(remoteAddrBytes)
 
+			// Extract the port from the received address
 			port, resolvedAddr, err := network.ResolveRemoteAddr(remoteAddr)
 			if err != nil {
 				c.logger.Infof("failed to resolve remote port: %v", err)
-				tunnelConn.Close()
+				tunnelConn.Close() // Close the connection on error
 				return
 			}
 
@@ -353,9 +342,11 @@ func (c *WsTransport) localDialer(tunnelCon *websocket.Conn, remoteAddr string, 
 	var sendBuf, recvBuf int
 
 	if strings.Contains(remoteAddr, "127.0.0.1") {
+		// Use 32 KB for localhost
 		sendBuf = 32 * 1024
 		recvBuf = 32 * 1024
 	} else {
+		// Use your custom buffer sizes
 		sendBuf = 0
 		recvBuf = 0
 	}
