@@ -57,6 +57,7 @@ func (s *Server) Start() {
 			SO_RCVBUF:     s.config.SO_RCVBUF,
 			SO_SNDBUF:     s.config.SO_SNDBUF,
 			ProxyProtocol: s.config.ProxyProtocol,
+			Obfuscation:   s.config.Obfuscation,
 		}
 
 		tcpServer := transport.NewTCPServer(s.ctx, tcpConfig, s.logger)

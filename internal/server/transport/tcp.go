@@ -13,6 +13,7 @@ import (
 	"github.com/musix/backhaul/internal/utils"
 	"github.com/musix/backhaul/internal/utils/handlers"
 	"github.com/musix/backhaul/internal/utils/network"
+	"github.com/musix/backhaul/internal/utils/obfs"
 	"github.com/musix/backhaul/internal/web"
 
 	"github.com/sirupsen/logrus"
@@ -50,6 +51,7 @@ type TcpConfig struct {
 	SO_RCVBUF     int
 	SO_SNDBUF     int
 	ProxyProtocol bool
+	Obfuscation   bool
 }
 
 func NewTCPServer(parentCtx context.Context, config *TcpConfig, logger *logrus.Logger) *TcpTransport {
@@ -346,11 +348,18 @@ func (s *TcpTransport) acceptTunnelConn(listener net.Listener) {
 				s.logger.Warnf("failed to set TCP keep-alive period for %s: %v", tcpConn.RemoteAddr().String(), err)
 			}
 
+			// Obfuscate the tunnel connection so the cleartext token handshake and
+			// fixed control bytes never appear on the wire (defeats DPI fingerprinting).
+			outConn := net.Conn(conn)
+			if s.config.Obfuscation {
+				outConn = obfs.Wrap(conn, s.config.Token)
+			}
+
 			select {
-			case s.tunnelChannel <- conn:
+			case s.tunnelChannel <- outConn:
 			default: // The channel is full, do nothing
 				s.logger.Warnf("tunnel listener channel is full, discarding TCP connection from %s", conn.LocalAddr().String())
-				conn.Close()
+				outConn.Close()
 			}
 		}
 	}

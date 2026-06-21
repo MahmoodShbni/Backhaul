@@ -63,6 +63,7 @@ func (c *Client) Start() {
 			MSS:            c.config.MSS,
 			SO_RCVBUF:      c.config.SO_RCVBUF,
 			SO_SNDBUF:      c.config.SO_SNDBUF,
+			Obfuscation:    c.config.Obfuscation,
 		}
 		tcpClient := transport.NewTCPClient(c.ctx, tcpConfig, c.logger)
 		go tcpClient.Start()

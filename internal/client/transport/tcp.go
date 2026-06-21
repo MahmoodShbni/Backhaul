@@ -12,6 +12,7 @@ import (
 	"github.com/musix/backhaul/internal/utils"
 	"github.com/musix/backhaul/internal/utils/handlers"
 	"github.com/musix/backhaul/internal/utils/network"
+	"github.com/musix/backhaul/internal/utils/obfs"
 	"github.com/musix/backhaul/internal/web"
 
 	"github.com/sirupsen/logrus"
@@ -46,6 +47,7 @@ type TcpConfig struct {
 	MSS            int
 	SO_RCVBUF      int
 	SO_SNDBUF      int
+	Obfuscation    bool
 }
 
 func NewTCPClient(parentCtx context.Context, config *TcpConfig, logger *logrus.Logger) *TcpTransport {
@@ -136,38 +138,44 @@ func (c *TcpTransport) channelDialer() {
 				continue
 			}
 
+			// Obfuscate the control channel (hides the cleartext token handshake).
+			var ctrlConn net.Conn = tunnelTCPConn
+			if c.config.Obfuscation {
+				ctrlConn = obfs.Wrap(tunnelTCPConn, c.config.Token)
+			}
+
 			// Sending security token
-			err = utils.SendBinaryTransportString(tunnelTCPConn, c.config.Token, utils.SG_Chan)
+			err = utils.SendBinaryTransportString(ctrlConn, c.config.Token, utils.SG_Chan)
 			if err != nil {
 				c.logger.Errorf("failed to send security token: %v", err)
-				tunnelTCPConn.Close()
+				ctrlConn.Close()
 				continue
 			}
 
 			// Set a read deadline for the token response
-			if err := tunnelTCPConn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+			if err := ctrlConn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
 				c.logger.Errorf("failed to set read deadline: %v", err)
-				tunnelTCPConn.Close()
+				ctrlConn.Close()
 				continue
 			}
 
 			// Receive response
-			message, _, err := utils.ReceiveBinaryTransportString(tunnelTCPConn)
+			message, _, err := utils.ReceiveBinaryTransportString(ctrlConn)
 			if err != nil {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 					c.logger.Warn("timeout while waiting for control channel response")
 				} else {
 					c.logger.Errorf("failed to receive control channel response: %v", err)
 				}
-				tunnelTCPConn.Close() // Close connection on error or timeout
+				ctrlConn.Close() // Close connection on error or timeout
 				time.Sleep(c.config.RetryInterval)
 				continue
 			}
 			// Resetting the deadline (removes any existing deadline)
-			tunnelTCPConn.SetReadDeadline(time.Time{})
+			ctrlConn.SetReadDeadline(time.Time{})
 
 			if message == c.config.Token {
-				c.controlChannel = tunnelTCPConn
+				c.controlChannel = ctrlConn
 				c.logger.Info("control channel established successfully")
 
 				c.config.TunnelStatus = "Connected (TCP)"
@@ -331,18 +339,24 @@ func (c *TcpTransport) tunnelDialer() {
 		return
 	}
 
+	// Obfuscate the data tunnel connection to match the control channel.
+	var tunnelConn net.Conn = tcpConn
+	if c.config.Obfuscation {
+		tunnelConn = obfs.Wrap(tcpConn, c.config.Token)
+	}
+
 	// Increment active connections counter
 	atomic.AddInt32(&c.poolConnections, 1)
 
 	// Attempt to receive the remote address from the tunnel server
-	remoteAddr, transport, err := utils.ReceiveBinaryTransportString(tcpConn)
+	remoteAddr, transport, err := utils.ReceiveBinaryTransportString(tunnelConn)
 
 	// Decrement active connections after successful or failed connection
 	atomic.AddInt32(&c.poolConnections, -1)
 
 	if err != nil {
-		c.logger.Debugf("failed to receive port from tunnel connection %s: %v", tcpConn.RemoteAddr().String(), err)
-		tcpConn.Close()
+		c.logger.Debugf("failed to receive port from tunnel connection %s: %v", tunnelConn.RemoteAddr().String(), err)
+		tunnelConn.Close()
 		return
 	}
 
@@ -350,21 +364,21 @@ func (c *TcpTransport) tunnelDialer() {
 	port, resolvedAddr, err := network.ResolveRemoteAddr(remoteAddr)
 	if err != nil {
 		c.logger.Infof("failed to resolve remote port: %v", err)
-		tcpConn.Close() // Close the connection on error
+		tunnelConn.Close() // Close the connection on error
 		return
 	}
 
 	switch transport {
 	case utils.SG_TCP:
 		// Dial local server using the received address
-		c.localDialer(tcpConn, resolvedAddr, port)
+		c.localDialer(tunnelConn, resolvedAddr, port)
 
 	case utils.SG_UDP:
-		UDPDialer(tcpConn, resolvedAddr, c.logger, c.usageMonitor, port, c.config.Sniffer)
+		UDPDialer(tunnelConn, resolvedAddr, c.logger, c.usageMonitor, port, c.config.Sniffer)
 
 	default:
 		c.logger.Error("undefined transport. close the connection.")
-		tcpConn.Close()
+		tunnelConn.Close()
 	}
 }
 
