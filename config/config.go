@@ -44,6 +44,8 @@ type ServerConfig struct {
 	SO_SNDBUF        int           `toml:"so_sndbuf"`
 	ProxyProtocol    bool          `toml:"proxy_protocol"`
 	Obfuscation      bool          `toml:"obfuscation"`
+	TLSCamouflage    bool          `toml:"tls_camouflage"`
+	SNI              string        `toml:"sni"`
 }
 
 // ClientConfig represents the configuration for the client.
@@ -73,6 +75,10 @@ type ClientConfig struct {
 	SO_RCVBUF        int           `toml:"so_rcvbuf"`
 	SO_SNDBUF        int           `toml:"so_sndbuf"`
 	Obfuscation      bool          `toml:"obfuscation"`
+	TLSCamouflage    bool          `toml:"tls_camouflage"`
+	SNI              string        `toml:"sni"`
+	TLSFingerprint   string        `toml:"tls_fingerprint"`
+	TLSInsecure      bool          `toml:"tls_insecure"`
 }
 
 // Config represents the complete configuration, including both server and client settings.

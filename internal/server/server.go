@@ -58,6 +58,10 @@ func (s *Server) Start() {
 			SO_SNDBUF:     s.config.SO_SNDBUF,
 			ProxyProtocol: s.config.ProxyProtocol,
 			Obfuscation:   s.config.Obfuscation,
+			TLSCamouflage: s.config.TLSCamouflage,
+			SNI:           s.config.SNI,
+			TLSCertFile:   s.config.TLSCertFile,
+			TLSKeyFile:    s.config.TLSKeyFile,
 		}
 
 		tcpServer := transport.NewTCPServer(s.ctx, tcpConfig, s.logger)

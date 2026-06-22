@@ -2,6 +2,7 @@ package transport
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"net"
 	"runtime"
@@ -14,6 +15,7 @@ import (
 	"github.com/musix/backhaul/internal/utils/handlers"
 	"github.com/musix/backhaul/internal/utils/network"
 	"github.com/musix/backhaul/internal/utils/obfs"
+	"github.com/musix/backhaul/internal/utils/tlsutil"
 	"github.com/musix/backhaul/internal/web"
 
 	"github.com/sirupsen/logrus"
@@ -32,6 +34,7 @@ type TcpTransport struct {
 	restartMutex   sync.Mutex
 	usageMonitor   *web.Usage
 	rtt            int64 // in ms, for UDP
+	tlsCert        *tls.Certificate
 }
 
 type TcpConfig struct {
@@ -52,6 +55,10 @@ type TcpConfig struct {
 	SO_SNDBUF     int
 	ProxyProtocol bool
 	Obfuscation   bool
+	TLSCamouflage bool
+	SNI           string
+	TLSCertFile   string
+	TLSKeyFile    string
 }
 
 func NewTCPServer(parentCtx context.Context, config *TcpConfig, logger *logrus.Logger) *TcpTransport {
@@ -78,6 +85,21 @@ func NewTCPServer(parentCtx context.Context, config *TcpConfig, logger *logrus.L
 
 func (s *TcpTransport) Start() {
 	s.config.TunnelStatus = "Disconnected (TCP)"
+
+	// Prepare the TLS certificate once when TLS camouflage is enabled.
+	if s.config.TLSCamouflage && s.tlsCert == nil {
+		cert, err := tlsutil.LoadOrSelfSign(s.config.TLSCertFile, s.config.TLSKeyFile, s.config.SNI)
+		if err != nil {
+			s.logger.Fatalf("failed to prepare TLS certificate: %v", err)
+			return
+		}
+		s.tlsCert = cert
+		if s.config.TLSCertFile != "" {
+			s.logger.Infof("TLS camouflage enabled (provided certificate, sni=%q)", s.config.SNI)
+		} else {
+			s.logger.Infof("TLS camouflage enabled (self-signed certificate, sni=%q)", s.config.SNI)
+		}
+	}
 
 	if s.config.WebPort > 0 {
 		go s.usageMonitor.Monitor()
@@ -350,17 +372,38 @@ func (s *TcpTransport) acceptTunnelConn(listener net.Listener) {
 
 			// Obfuscate the tunnel connection so the cleartext token handshake and
 			// fixed control bytes never appear on the wire (defeats DPI fingerprinting).
-			outConn := net.Conn(conn)
-			if s.config.Obfuscation {
-				outConn = obfs.Wrap(conn, s.config.Token)
-			}
+			// The TLS handshake (when enabled) costs a round trip, so perform the
+			// wrapping and channel hand-off in a goroutine to keep the accept loop
+			// from serializing on it.
+			go func(conn net.Conn) {
+				outConn := conn
 
-			select {
-			case s.tunnelChannel <- outConn:
-			default: // The channel is full, do nothing
-				s.logger.Warnf("tunnel listener channel is full, discarding TCP connection from %s", conn.LocalAddr().String())
-				outConn.Close()
-			}
+				// TLS camouflage is the OUTERMOST layer: the first bytes on the wire
+				// become a real TLS ServerHello in response to the browser-shaped
+				// ClientHello, so the stream looks like ordinary HTTPS.
+				if s.config.TLSCamouflage {
+					wrapped, err := tlsutil.ServerWrap(conn, s.tlsCert, 10*time.Second)
+					if err != nil {
+						s.logger.Debugf("tls handshake with %s failed: %v", conn.RemoteAddr().String(), err)
+						conn.Close()
+						return
+					}
+					outConn = wrapped
+				}
+
+				if s.config.Obfuscation {
+					outConn = obfs.Wrap(outConn, s.config.Token)
+				}
+
+				select {
+				case s.tunnelChannel <- outConn:
+				case <-s.ctx.Done():
+					outConn.Close()
+				default: // The channel is full, do nothing
+					s.logger.Warnf("tunnel listener channel is full, discarding TCP connection from %s", conn.LocalAddr().String())
+					outConn.Close()
+				}
+			}(conn)
 		}
 	}
 }

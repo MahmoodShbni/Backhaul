@@ -6,6 +6,7 @@ require (
 	github.com/BurntSushi/toml v1.4.0
 	github.com/gorilla/websocket v1.5.3
 	github.com/shirou/gopsutil/v4 v4.24.8
+	github.com/refraction-networking/utls v1.6.7
 	github.com/sirupsen/logrus v1.9.3
 	github.com/xtaci/smux v1.5.27
 )
@@ -17,6 +18,10 @@ require (
 	github.com/shoenig/go-m1cpu v0.1.6 // indirect
 	github.com/tklauser/go-sysconf v0.3.14 // indirect
 	github.com/tklauser/numcpus v0.8.0 // indirect
+	github.com/andybalholm/brotli v1.1.0 // indirect
+	github.com/cloudflare/circl v1.3.7 // indirect
+	github.com/klauspost/compress v1.17.4 // indirect
 	github.com/yusufpapurcu/wmi v1.2.4 // indirect
+	golang.org/x/crypto v0.21.0 // indirect
 	golang.org/x/sys v0.25.0 // indirect
 )

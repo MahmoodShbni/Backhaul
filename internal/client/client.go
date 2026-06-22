@@ -64,6 +64,10 @@ func (c *Client) Start() {
 			SO_RCVBUF:      c.config.SO_RCVBUF,
 			SO_SNDBUF:      c.config.SO_SNDBUF,
 			Obfuscation:    c.config.Obfuscation,
+			TLSCamouflage:  c.config.TLSCamouflage,
+			SNI:            c.config.SNI,
+			TLSFingerprint: c.config.TLSFingerprint,
+			TLSInsecure:    c.config.TLSInsecure,
 		}
 		tcpClient := transport.NewTCPClient(c.ctx, tcpConfig, c.logger)
 		go tcpClient.Start()

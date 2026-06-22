@@ -13,6 +13,7 @@ import (
 	"github.com/musix/backhaul/internal/utils/handlers"
 	"github.com/musix/backhaul/internal/utils/network"
 	"github.com/musix/backhaul/internal/utils/obfs"
+	"github.com/musix/backhaul/internal/utils/tlsutil"
 	"github.com/musix/backhaul/internal/web"
 
 	"github.com/sirupsen/logrus"
@@ -48,6 +49,10 @@ type TcpConfig struct {
 	SO_RCVBUF      int
 	SO_SNDBUF      int
 	Obfuscation    bool
+	TLSCamouflage  bool
+	SNI            string
+	TLSFingerprint string
+	TLSInsecure    bool
 }
 
 func NewTCPClient(parentCtx context.Context, config *TcpConfig, logger *logrus.Logger) *TcpTransport {
@@ -140,8 +145,20 @@ func (c *TcpTransport) channelDialer() {
 
 			// Obfuscate the control channel (hides the cleartext token handshake).
 			var ctrlConn net.Conn = tunnelTCPConn
+			// TLS camouflage is applied first so a browser-shaped ClientHello with a
+			// real SNI is the first thing on the wire.
+			if c.config.TLSCamouflage {
+				wrapped, err := tlsutil.ClientWrap(ctrlConn, c.config.SNI, c.config.TLSFingerprint, c.config.TLSInsecure, 10*time.Second)
+				if err != nil {
+					c.logger.Errorf("control channel tls handshake failed: %v", err)
+					tunnelTCPConn.Close()
+					time.Sleep(c.config.RetryInterval)
+					continue
+				}
+				ctrlConn = wrapped
+			}
 			if c.config.Obfuscation {
-				ctrlConn = obfs.Wrap(tunnelTCPConn, c.config.Token)
+				ctrlConn = obfs.Wrap(ctrlConn, c.config.Token)
 			}
 
 			// Sending security token
@@ -341,8 +358,17 @@ func (c *TcpTransport) tunnelDialer() {
 
 	// Obfuscate the data tunnel connection to match the control channel.
 	var tunnelConn net.Conn = tcpConn
+	if c.config.TLSCamouflage {
+		wrapped, err := tlsutil.ClientWrap(tunnelConn, c.config.SNI, c.config.TLSFingerprint, c.config.TLSInsecure, 10*time.Second)
+		if err != nil {
+			c.logger.Debugf("tunnel tls handshake failed: %v", err)
+			tcpConn.Close()
+			return
+		}
+		tunnelConn = wrapped
+	}
 	if c.config.Obfuscation {
-		tunnelConn = obfs.Wrap(tcpConn, c.config.Token)
+		tunnelConn = obfs.Wrap(tunnelConn, c.config.Token)
 	}
 
 	// Increment active connections counter
